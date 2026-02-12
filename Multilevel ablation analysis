@@ -1,0 +1,3037 @@
+###########################################################################
+Importing libraries
+###########################################################################
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from econml.dml import LinearDML
+from sklearn.linear_model import LassoCV, LogisticRegression
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.metrics import mean_squared_error, r2_score, accuracy_score
+from scipy import stats
+import math
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Dict, Tuple, List, Optional, Any
+from abc import ABC, abstractmethod
+import copy
+from collections import defaultdict
+###########################################################################
+
+# Importing the original dataset (non-preprocessed)
+data = pd.read_csv("urban_mobility_data.csv")
+
+# Sampling with temporal-preserviation:
+def simple_temporal_sample(df, fraction=0.1):
+    """
+    Simple but preserves temporal order
+    """
+    # Sort by time
+    df = df.sort_values(['zone_id', 'timestamp'])
+    
+    # Take first N% of time periods for each zone
+    sampled_zones = []
+    for zone_id in df['zone_id'].unique():
+        zone_data = df[df['zone_id'] == zone_id].copy()
+        n_to_keep = int(len(zone_data) * fraction)
+        zone_sample = zone_data.iloc[:n_to_keep]
+        sampled_zones.append(zone_sample)
+    
+    result = pd.concat(sampled_zones, ignore_index=True)
+    
+    print(f"Sampled {len(result):,} from {len(df):,}")
+    print(f"Preserves temporal order within each zone")
+    
+    return result
+
+# Calling the function
+df_sampled = simple_temporal_sample(data, fraction=0.25)
+
+########################################################################
+1. CAUSAL ANALYSIS
+====================
+A. Average Treatment Effects (ATE) with DML
+--------------------------------------------
+def analyze_causal_effects_direct(df):
+    """
+    Direct causal analysis on your generated dataset
+    """
+    print("="*60)
+    print("DIRECT CAUSAL ANALYSIS ON GENERATED DATA")
+    print("="*60)
+    
+    # ============================================================
+    # STEP 1: USE EXISTING FEATURES (NO EXTRA ENGINEERING NEEDED)
+    # ============================================================
+    # Perfect confounders from the generation:
+    confounders = [
+        'hour',           # Time of day
+        'is_peak',        # Peak hours  
+        'is_weekend',     # Weekend
+        'vehicle_count',  # Traffic volume
+        'road_quality',   # Road condition
+        'rain',           # Weather
+        'event',          # Special events
+        'zone_type'       # Zone type (categorical)
+    ]
+    
+    # Convert categorical
+    df_encoded = df.copy()
+    zone_dummies = pd.get_dummies(df['zone_type'], prefix='zone', drop_first=True)
+    df_encoded = pd.concat([df_encoded, zone_dummies], axis=1)
+    
+    # Update confounders list
+    confounders_numeric = [c for c in confounders if c != 'zone_type'] + zone_dummies.columns.tolist()
+    
+    # ============================================================
+    # STEP 2: EXTRACT VARIABLES
+    # ============================================================
+    Y = df_encoded['final_delay'].values
+    T = df_encoded['toll_active'].values
+    X = df_encoded[confounders_numeric].values
+    
+    print(f"Data shapes:")
+    print(f"  Y (final_delay): {Y.shape}")
+    print(f"  T (toll_active): {T.shape}")
+    print(f"  X (confounders): {X.shape} ({len(confounders_numeric)} features)")
+    
+    # ============================================================
+    # STEP 3: VALIDATION
+    # ============================================================
+    print(f"\n validation:")
+    print(f"  Treatment prevalence: {T.mean():.2%}")
+    
+    # True ATE from generation (weighted average)
+    true_effects = {'residential': 0.10, 'commercial': 0.15, 'mixed': 0.12}
+    zone_props = df['zone_type'].value_counts(normalize=True)
+    true_ate = sum(true_effects[zone] * zone_props[zone] for zone in true_effects)
+    print(f"  True ATE (from generation): {true_ate:.1%} reduction")
+    
+    # Observed difference
+    naive_diff = df[df['toll_active']==0]['final_delay'].mean() - df[df['toll_active']==1]['final_delay'].mean()
+    naive_ate = naive_diff / df[df['toll_active']==0]['final_delay'].mean()
+    print(f"  Naive ATE (unadjusted): {naive_ate:.1%} reduction")
+    
+    # ============================================================
+    # STEP 4: SCALE AND RUN DML
+    # ============================================================
+    print("\nRunning Double Machine Learning...")
+    
+    # Scale features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # DML model
+    dml = LinearDML(
+        model_y=LassoCV(cv=3, n_alphas=20),
+        model_t=LogisticRegression(max_iter=1000, class_weight='balanced', solver='lbfgs'),
+        discrete_treatment=True,
+        cv=3
+    )
+    
+    dml.fit(Y, T, X=X_scaled)
+    
+    # ============================================================
+    # STEP 5: RESULTS
+    # ============================================================
+    ate = dml.ate(X_scaled)
+    ci_lower, ci_upper = dml.ate_interval(X_scaled)
+    
+    print(f"\nDML Results:")
+    print(f"  ATE: {ate:.4f}")
+    print(f"  95% CI: [{ci_lower:.4f}, {ci_upper:.4f}]")
+    
+    # Convert to percentage
+    ate_pct = ate / df['final_delay'].mean()
+    print(f"  ATE (% reduction): {abs(ate_pct):.1%}")
+    
+    # Compare with true ATE
+    print(f"\nValidation vs True ATE:")
+    print(f"  True: {true_ate:.1%} reduction")
+    print(f"  DML: {abs(ate_pct):.1%} reduction")
+    print(f"  Difference: {abs(abs(ate_pct) - true_ate):.1%}")
+    
+    return dml, ate, X_scaled, Y, T
+
+# Runing analysis
+dml_model, ate_result, X_ready, Y_ready, T_ready = analyze_causal_effects_direct(df_sampled)
+
+2. Heterogenous Treatment Effects (HTE)
+========================================
+A. Using DML
+------------
+ef get_hte_by_groups(dml_model, X, df, confounders_used=None):
+    """
+    Get HTE for different groups using fitted DML model
+    """
+    # Get CATEs for all observations
+    cates = dml_model.effect(X)
+    
+    # Create DataFrame with CATEs and grouping variables
+    results = pd.DataFrame({
+        'cate': cates,
+        'zone_type': df['zone_type'].values,
+        'hour': df['hour'].values,
+        'is_peak': df['is_peak'].values,
+        'is_weekend': df['is_weekend'].values,
+        'vehicle_count': df['vehicle_count'].values,
+        'road_quality': df['road_quality'].values,
+        'rain': df['rain'].values,
+        'event': df['event'].values
+    })
+
+    # Make sure df_sampled has these columns
+    print("Checking required columns in df_sampled:")
+    required_cols = ['zone_type', 'hour', 'is_peak', 'is_weekend', 
+                     'vehicle_count', 'road_quality', 'rain', 'event']
+    missing = [col for col in required_cols if col not in df_sampled.columns]
+    if missing:
+        print(f"⚠ Missing columns: {missing}")
+        
+    print("="*60)
+    print("HETEROGENEOUS TREATMENT EFFECTS (HTE)")
+    print("="*60)
+        
+    # 1. HTE by Zone Type
+    print("\n1. HTE by Zone Type:")
+    print("-" * 40)
+    for zone in results['zone_type'].unique():
+        zone_mask = results['zone_type'] == zone
+        zone_cates = results.loc[zone_mask, 'cate']
+        print(f"{zone:15s}: Mean CATE = {zone_cates.mean():.4f} (n={len(zone_cates):,})")
+    
+    # 2. HTE by Hour
+    print("\n2. HTE by Hour:")
+    print("-" * 40)
+    hourly_hte = results.groupby('hour')['cate'].agg(['mean', 'std', 'count'])
+    for hour in range(24):
+        if hour in hourly_hte.index:
+            print(f"Hour {hour:2d}: {hourly_hte.loc[hour, 'mean']:.4f} ± {hourly_hte.loc[hour, 'std']:.4f}")
+    
+    # 3. HTE by Peak vs Off-Peak
+    print("\n3. HTE by Peak vs Off-Peak:")
+    print("-" * 40)
+    peak_hte = results.groupby('is_peak')['cate'].agg(['mean', 'std', 'count'])
+    print(f"Off-Peak (0): {peak_hte.loc[0, 'mean']:.4f} ± {peak_hte.loc[0, 'std']:.4f}")
+    print(f"Peak     (1): {peak_hte.loc[1, 'mean']:.4f} ± {peak_hte.loc[1, 'std']:.4f}")
+    print(f"Difference: {peak_hte.loc[1, 'mean'] - peak_hte.loc[0, 'mean']:.4f}")
+    
+    # 4. HTE by Weekend
+    print("\n4. HTE by Weekend:")
+    print("-" * 40)
+    weekend_hte = results.groupby('is_weekend')['cate'].agg(['mean', 'std', 'count'])
+    print(f"Weekday (0): {weekend_hte.loc[0, 'mean']:.4f} ± {weekend_hte.loc[0, 'std']:.4f}")
+    print(f"Weekend (1): {weekend_hte.loc[1, 'mean']:.4f} ± {weekend_hte.loc[1, 'std']:.4f}")
+    
+    # 5. HTE by Road Quality (quartiles)
+    print("\n5. HTE by Road Quality (Quartiles):")
+    print("-" * 40)
+    results['road_quality_q'] = pd.qcut(results['road_quality'], q=4, labels=['Q1 (worst)', 'Q2', 'Q3', 'Q4 (best)'])
+    road_hte = results.groupby('road_quality_q')['cate'].agg(['mean', 'std', 'count'])
+    for q in road_hte.index:
+        print(f"{q:12s}: {road_hte.loc[q, 'mean']:.4f} ± {road_hte.loc[q, 'std']:.4f}")
+    
+    # 6. HTE by Traffic Volume (terciles)
+    print("\n6. HTE by Traffic Volume (Terciles):")
+    print("-" * 40)
+    results['vehicle_count_t'] = pd.qcut(results['vehicle_count'], q=3, labels=['Low', 'Medium', 'High'])
+    traffic_hte = results.groupby('vehicle_count_t')['cate'].agg(['mean', 'std', 'count'])
+    for t in traffic_hte.index:
+        print(f"{t:7s}: {traffic_hte.loc[t, 'mean']:.4f} ± {traffic_hte.loc[t, 'std']:.4f}")
+    
+    # 7. HTE by Weather Conditions
+    print("\n7. HTE by Weather Conditions:")
+    print("-" * 40)
+    weather_hte = results.groupby('rain')['cate'].agg(['mean', 'std', 'count'])
+    print(f"No Rain (0): {weather_hte.loc[0, 'mean']:.4f} ± {weather_hte.loc[0, 'std']:.4f}")
+    print(f"Rain    (1): {weather_hte.loc[1, 'mean']:.4f} ± {weather_hte.loc[1, 'std']:.4f}")
+    
+    # 8. HTE by Events
+    print("\n8. HTE by Events:")
+    print("-" * 40)
+    event_hte = results.groupby('event')['cate'].agg(['mean', 'std', 'count'])
+    print(f"No Event (0): {event_hte.loc[0, 'mean']:.4f} ± {event_hte.loc[0, 'std']:.4f}")
+    print(f"Event    (1): {event_hte.loc[1, 'mean']:.4f} ± {event_hte.loc[1, 'std']:.4f}")
+    
+    return results
+
+# Define confounders_used OUTSIDE the function
+confounders_used = [
+    'hour', 'is_peak', 'is_weekend',
+    'vehicle_count', 'road_quality',
+    'rain', 'event',
+    'zone_mixed', 'zone_residential']  
+
+# Use it
+hte_results = get_hte_by_groups(dml_model, X_ready, df_sampled, confounders_used)
+
+
+# Computing nuisance
+---------------------
+def get_nuisance_from_dml(dml_model, X, Y, T):
+    """
+    Try to extract nuisance models from fitted DML
+    """
+    print("Attempting to extract nuisance models from DML...")
+    
+    # Check if DML stores the models
+    if hasattr(dml_model, 'models_y') and hasattr(dml_model, 'models_t'):
+        print("✓ DML stores fitted nuisance models")
+        
+        # DML uses cross-fitting, so we have multiple models
+        print(f"  Found {len(dml_model.models_y)} outcome models")
+        print(f"  Found {len(dml_model.models_t)} treatment models")
+        
+        # Get predictions from all folds
+        all_y_preds = []
+        all_t_preds = []
+        
+        for i, (model_y, model_t) in enumerate(zip(dml_model.models_y, dml_model.models_t)):
+            # Get predictions for this fold
+            y_pred = model_y.predict(X)
+            if hasattr(model_t, 'predict_proba'):
+                t_pred = model_t.predict_proba(X)[:, 1]
+            else:
+                t_pred = model_t.predict(X)
+            
+            all_y_preds.append(y_pred)
+            all_t_preds.append(t_pred)
+        
+        # Average predictions (or use appropriate fold assignments)
+        y_pred_avg = np.mean(all_y_preds, axis=0)
+        t_pred_avg = np.mean(all_t_preds, axis=0)
+        
+        return y_pred_avg, t_pred_avg, dml_model.models_y, dml_model.models_t
+    
+    else:
+        print("✗ DML doesn't store fitted models directly")
+        return None, None, None, None
+
+
+def evaluate_nuisance_models_correctly(X, Y, T, n_splits=5):
+    """
+    Manually recreate DML's cross-fitting to evaluate nuisance models
+    """
+    from sklearn.metrics import mean_squared_error, r2_score, roc_auc_score, accuracy_score
+    
+    print(f"\nManually evaluating nuisance models with {n_splits}-fold CV:")
+    
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    
+    # Store metrics
+    mse_scores = []
+    r2_scores = []
+    auc_scores = []
+    acc_scores = []
+    
+    # Store predictions
+    y_preds = np.zeros_like(Y, dtype=float)
+    t_preds = np.zeros_like(T, dtype=float)
+    
+    fold = 0
+    for train_idx, test_idx in kf.split(X):
+        fold += 1
+        print(f"\n  Fold {fold}/{n_splits}:")
+        
+        # Split data
+        X_train, X_test = X[train_idx], X[test_idx]
+        Y_train, Y_test = Y[train_idx], Y[test_idx]
+        T_train, T_test = T[train_idx], T[test_idx]
+        
+        # Train outcome model
+        model_y = LassoCV(cv=3, n_alphas=20, random_state=42)
+        model_y.fit(X_train, Y_train)
+        y_pred = model_y.predict(X_test)
+        
+        # Train treatment model
+        model_t = LogisticRegression(max_iter=1000, class_weight='balanced', solver='lbfgs')
+        model_t.fit(X_train, T_train)
+        t_pred_proba = model_t.predict_proba(X_test)[:, 1]
+        
+        # Store predictions
+        y_preds[test_idx] = y_pred
+        t_preds[test_idx] = t_pred_proba
+        
+        # Calculate metrics
+        mse = mean_squared_error(Y_test, y_pred)
+        r2 = r2_score(Y_test, y_pred)
+        auc = roc_auc_score(T_test, t_pred_proba)
+        acc = accuracy_score(T_test, t_pred_proba > 0.5)
+        
+        mse_scores.append(mse)
+        r2_scores.append(r2)
+        auc_scores.append(auc)
+        acc_scores.append(acc)
+        
+        print(f"    Outcome: MSE={mse:.3f}, R²={r2:.3f}")
+        print(f"    Treatment: AUC={auc:.3f}, Acc={acc:.3f}")
+    
+    # Overall metrics
+    print(f"\nOverall Nuisance Model Performance:")
+    print(f"  Outcome Model:")
+    print(f"    Mean MSE: {np.mean(mse_scores):.3f} (±{np.std(mse_scores):.3f})")
+    print(f"    Mean R²: {np.mean(r2_scores):.3f} (±{np.std(r2_scores):.3f})")
+    print(f"  Treatment Model:")
+    print(f"    Mean AUC: {np.mean(auc_scores):.3f} (±{np.std(auc_scores):.3f})")
+    print(f"    Mean Accuracy: {np.mean(acc_scores):.3f} (±{np.std(acc_scores):.3f})")
+    
+    return y_preds, t_preds
+
+# Fitting the DML model
+dml = LinearDML(
+    model_y=LassoCV(cv=3, n_alphas=20, random_state=42),
+    model_t=LogisticRegression(max_iter=1000, class_weight='balanced', solver='lbfgs'),
+    discrete_treatment=True,
+    cv=5  # Use 5-fold cross-fitting
+)
+
+dml.fit(Y_ready, T_ready, X=X_ready)
+
+# Now evaluate nuisance models CORRECTLY:
+
+# Manual cross-fitting evaluation
+print("="*60)
+print("OPTION A: Manual Cross-Fitting Evaluation")
+print("="*60)
+y_preds_cv, t_preds_cv = evaluate_nuisance_models_correctly(X_ready, Y_ready, T_ready, n_splits=5)
+
+B. Using Causal Forest
+-----------------------
+def get_hte_with_causal_forest(X, Y, T, df):
+    """
+    Use Causal Forest to estimate HTE with uncertainty - ENHANCED VERSION
+    """
+    print("Training Causal Forest for HTE estimation...")
+    
+    cf = CausalForestDML(
+        model_y=RandomForestRegressor(n_estimators=100, random_state=42),
+        model_t=RandomForestClassifier(n_estimators=100, random_state=42),
+        n_estimators=100,
+        min_samples_leaf=10,
+        max_depth=20,
+        discrete_treatment=True,
+        random_state=42,
+        cv=3
+    )
+    
+    cf.fit(Y, T, X=X)
+    
+    # Get CATEs with confidence intervals
+    cates_cf = cf.effect(X)
+    cates_ci = cf.effect_interval(X, alpha=0.05)  # 95% CI
+    
+    # Create comprehensive results DataFrame
+    results_cf = pd.DataFrame({
+        'cate': cates_cf,
+        'cate_lower': cates_ci[0],
+        'cate_upper': cates_ci[1],
+        'zone_type': df['zone_type'].values,
+        'hour': df['hour'].values,
+        'is_peak': df['is_peak'].values,
+        'is_weekend': df['is_weekend'].values,
+        'vehicle_count': df['vehicle_count'].values,
+        'road_quality': df['road_quality'].values,
+        'rain': df['rain'].values,
+        'event': df['event'].values
+    })
+    
+    # Calculate confidence interval width
+    results_cf['ci_width'] = results_cf['cate_upper'] - results_cf['cate_lower']
+    results_cf['ci_coverage'] = (results_cf['cate'] >= results_cf['cate_lower']) & (results_cf['cate'] <= results_cf['cate_upper'])
+    
+    # Analyze HTE
+    print("\n" + "="*70)
+    print("CAUSAL FOREST HTE ANALYSIS WITH CONFIDENCE INTERVALS")
+    print("="*70)
+    
+    # 1. HTE by Zone Type with Confidence Intervals
+    print("\n1. HTE by Zone Type (with 95% CI):")
+    print("-" * 50)
+    for zone in results_cf['zone_type'].unique():
+        zone_mask = results_cf['zone_type'] == zone
+        zone_data = results_cf.loc[zone_mask]
+        
+        mean_cate = zone_data['cate'].mean()
+        ci_lower = zone_data['cate_lower'].mean()
+        ci_upper = zone_data['cate_upper'].mean()
+        ci_width = zone_data['ci_width'].mean()
+        coverage = zone_data['ci_coverage'].mean()
+        
+        print(f"{zone:15s}: {mean_cate:7.4f} [{ci_lower:.4f}, {ci_upper:.4f}] "
+              f"(CI width: {ci_width:.4f}, Coverage: {coverage:.1%})")
+    
+    # 2. HTE by Hour with Confidence Intervals
+    print("\n2. HTE by Hour (with 95% CI):")
+    print("-" * 50)
+    hourly_hte = results_cf.groupby('hour').agg({
+        'cate': ['mean', 'std', 'count'],
+        'cate_lower': 'mean',
+        'cate_upper': 'mean',
+        'ci_width': 'mean'
+    })
+    
+    hourly_hte.columns = ['mean', 'std', 'count', 'ci_lower', 'ci_upper', 'ci_width']
+    
+    for hour in range(24):
+        if hour in hourly_hte.index:
+            row = hourly_hte.loc[hour]
+            print(f"Hour {hour:2d}: {row['mean']:.4f} ± {row['std']:.4f} "
+                  f"[{row['ci_lower']:.4f}, {row['ci_upper']:.4f}] (CI width: {row['ci_width']:.4f})")
+    
+    # 3. HTE by Peak vs Off-Peak with CIs
+    print("\n3. HTE by Peak vs Off-Peak:")
+    print("-" * 50)
+    peak_hte = results_cf.groupby('is_peak').agg({
+        'cate': ['mean', 'std', 'count'],
+        'cate_lower': 'mean',
+        'cate_upper': 'mean'
+    })
+    
+    for peak_val in [0, 1]:
+        if peak_val in peak_hte.index:
+            mean_cate = peak_hte.loc[peak_val, ('cate', 'mean')]
+            ci_lower = peak_hte.loc[peak_val, ('cate_lower', 'mean')]
+            ci_upper = peak_hte.loc[peak_val, ('cate_upper', 'mean')]
+            label = "Off-Peak" if peak_val == 0 else "Peak"
+            
+            print(f"{label:12s}: {mean_cate:.4f} [{ci_lower:.4f}, {ci_upper:.4f}]")
+    
+    # Calculate difference with CI
+    if 0 in peak_hte.index and 1 in peak_hte.index:
+        diff = peak_hte.loc[1, ('cate', 'mean')] - peak_hte.loc[0, ('cate', 'mean')]
+        # Approximate CI for difference
+        se_diff = np.sqrt(
+            (peak_hte.loc[1, ('cate', 'std')]**2 / peak_hte.loc[1, ('cate', 'count')]) +
+            (peak_hte.loc[0, ('cate', 'std')]**2 / peak_hte.loc[0, ('cate', 'count')])
+        )
+        ci_lower_diff = diff - 1.96 * se_diff
+        ci_upper_diff = diff + 1.96 * se_diff
+        
+        print(f"Difference: {diff:.4f} [{ci_lower_diff:.4f}, {ci_upper_diff:.4f}]")
+    
+    # 4. HTE by Weekend with CIs
+    print("\n4. HTE by Weekend:")
+    print("-" * 50)
+    weekend_hte = results_cf.groupby('is_weekend').agg({
+        'cate': ['mean', 'std', 'count'],
+        'cate_lower': 'mean',
+        'cate_upper': 'mean'
+    })
+    
+    for weekend_val in [0, 1]:
+        if weekend_val in weekend_hte.index:
+            mean_cate = weekend_hte.loc[weekend_val, ('cate', 'mean')]
+            ci_lower = weekend_hte.loc[weekend_val, ('cate_lower', 'mean')]
+            ci_upper = weekend_hte.loc[weekend_val, ('cate_upper', 'mean')]
+            label = "Weekday" if weekend_val == 0 else "Weekend"
+            
+            print(f"{label:12s}: {mean_cate:.4f} [{ci_lower:.4f}, {ci_upper:.4f}]")
+    
+    # 5. HTE by Road Quality (quartiles) with CIs
+    print("\n5. HTE by Road Quality (Quartiles):")
+    print("-" * 50)
+    results_cf['road_quality_q'] = pd.qcut(results_cf['road_quality'], q=4, 
+                                          labels=['Q1 (worst)', 'Q2', 'Q3', 'Q4 (best)'])
+    
+    road_hte = results_cf.groupby('road_quality_q').agg({
+        'cate': ['mean', 'std', 'count'],
+        'cate_lower': 'mean',
+        'cate_upper': 'mean',
+        'ci_width': 'mean'
+    })
+    
+    for q in road_hte.index:
+        mean_cate = road_hte.loc[q, ('cate', 'mean')]
+        ci_lower = road_hte.loc[q, ('cate_lower', 'mean')]
+        ci_upper = road_hte.loc[q, ('cate_upper', 'mean')]
+        ci_width = road_hte.loc[q, ('ci_width', 'mean')]
+        
+        print(f"{q:12s}: {mean_cate:.4f} [{ci_lower:.4f}, {ci_upper:.4f}] "
+              f"(CI width: {ci_width:.4f})")
+    
+    # 6. HTE by Traffic Volume (terciles) with CIs
+    print("\n6. HTE by Traffic Volume (Terciles):")
+    print("-" * 50)
+    results_cf['vehicle_count_t'] = pd.qcut(results_cf['vehicle_count'], q=3, 
+                                           labels=['Low', 'Medium', 'High'])
+    
+    traffic_hte = results_cf.groupby('vehicle_count_t').agg({
+        'cate': ['mean', 'std', 'count'],
+        'cate_lower': 'mean',
+        'cate_upper': 'mean',
+        'ci_width': 'mean'
+    })
+    
+    for t in traffic_hte.index:
+        mean_cate = traffic_hte.loc[t, ('cate', 'mean')]
+        ci_lower = traffic_hte.loc[t, ('cate_lower', 'mean')]
+        ci_upper = traffic_hte.loc[t, ('cate_upper', 'mean')]
+        ci_width = traffic_hte.loc[t, ('ci_width', 'mean')]
+        
+        print(f"{t:7s}: {mean_cate:.4f} [{ci_lower:.4f}, {ci_upper:.4f}] "
+              f"(CI width: {ci_width:.4f})")
+    
+    # 7. HTE by Weather Conditions with CIs
+    print("\n7. HTE by Weather Conditions:")
+    print("-" * 50)
+    weather_hte = results_cf.groupby('rain').agg({
+        'cate': ['mean', 'std', 'count'],
+        'cate_lower': 'mean',
+        'cate_upper': 'mean'
+    })
+    
+    for rain_val in [0, 1]:
+        if rain_val in weather_hte.index:
+            mean_cate = weather_hte.loc[rain_val, ('cate', 'mean')]
+            ci_lower = weather_hte.loc[rain_val, ('cate_lower', 'mean')]
+            ci_upper = weather_hte.loc[rain_val, ('cate_upper', 'mean')]
+            label = "No Rain" if rain_val == 0 else "Rain"
+            
+            print(f"{label:12s}: {mean_cate:.4f} [{ci_lower:.4f}, {ci_upper:.4f}]")
+    
+    # 8. HTE by Events with CIs
+    print("\n8. HTE by Events:")
+    print("-" * 50)
+    event_hte = results_cf.groupby('event').agg({
+        'cate': ['mean', 'std', 'count'],
+        'cate_lower': 'mean',
+        'cate_upper': 'mean'
+    })
+    
+    for event_val in [0, 1]:
+        if event_val in event_hte.index:
+            mean_cate = event_hte.loc[event_val, ('cate', 'mean')]
+            ci_lower = event_hte.loc[event_val, ('cate_lower', 'mean')]
+            ci_upper = event_hte.loc[event_val, ('cate_upper', 'mean')]
+            label = "No Event" if event_val == 0 else "Event"
+            
+            print(f"{label:12s}: {mean_cate:.4f} [{ci_lower:.4f}, {ci_upper:.4f}]")
+    
+    # 9. Statistical Significance Analysis
+    print("\n9. STATISTICAL SIGNIFICANCE ANALYSIS:")
+    print("-" * 50)
+    
+    # Check which HTEs are statistically significant (CI doesn't include 0)
+    print("Statistically Significant Effects (95% CI doesn't include 0):")
+    significant_groups = []
+    
+    # Zone types
+    for zone in results_cf['zone_type'].unique():
+        zone_mask = results_cf['zone_type'] == zone
+        zone_data = results_cf.loc[zone_mask]
+        ci_lower = zone_data['cate_lower'].mean()
+        ci_upper = zone_data['cate_upper'].mean()
+        
+        if (ci_lower > 0 and ci_upper > 0) or (ci_lower < 0 and ci_upper < 0):
+            significant_groups.append(f"Zone: {zone}")
+    
+    # Traffic volume
+    for traffic in ['Low', 'Medium', 'High']:
+        if 'vehicle_count_t' in results_cf.columns:
+            traffic_mask = results_cf['vehicle_count_t'] == traffic
+            if traffic_mask.any():
+                traffic_data = results_cf.loc[traffic_mask]
+                ci_lower = traffic_data['cate_lower'].mean()
+                ci_upper = traffic_data['cate_upper'].mean()
+                
+                if (ci_lower > 0 and ci_upper > 0) or (ci_lower < 0 and ci_upper < 0):
+                    significant_groups.append(f"Traffic: {traffic}")
+    
+    if significant_groups:
+        for i, group in enumerate(significant_groups[:10], 1):  # Show top 10
+            print(f"{i:2d}. {group}")
+        if len(significant_groups) > 10:
+            print(f"  ... and {len(significant_groups) - 10} more")
+    else:
+        print("No statistically significant effects detected at 95% confidence level")
+    
+    # 10. Uncertainty Analysis
+    print("\n10. UNCERTAINTY ANALYSIS:")
+    print("-" * 50)
+    
+    avg_ci_width = results_cf['ci_width'].mean()
+    median_ci_width = results_cf['ci_width'].median()
+    ci_coverage_rate = results_cf['ci_coverage'].mean()
+    
+    print(f"Average CI width: {avg_ci_width:.4f}")
+    print(f"Median CI width:  {median_ci_width:.4f}")
+    print(f"CI coverage rate: {ci_coverage_rate:.1%}")
+    
+    # Categorize uncertainty
+    if avg_ci_width < 0.2:
+        uncertainty_level = "Low"
+    elif avg_ci_width < 0.5:
+        uncertainty_level = "Moderate"
+    else:
+        uncertainty_level = "High"
+    
+    print(f"Overall uncertainty: {uncertainty_level}")
+    
+    # 11. Ranking by Treatment Effect with CIs
+    print("\n11. RANKING BY TREATMENT EFFECT:")
+    print("-" * 50)
+    
+    # Group by all combinations for ranking
+    ranking_data = []
+    
+    # Zone type ranking
+    for zone in results_cf['zone_type'].unique():
+        zone_mask = results_cf['zone_type'] == zone
+        mean_effect = results_cf.loc[zone_mask, 'cate'].mean()
+        ci_lower = results_cf.loc[zone_mask, 'cate_lower'].mean()
+        ci_upper = results_cf.loc[zone_mask, 'cate_upper'].mean()
+        ranking_data.append({
+            'group': f"Zone: {zone}",
+            'effect': mean_effect,
+            'ci_lower': ci_lower,
+            'ci_upper': ci_upper
+        })
+    
+    # Traffic volume ranking
+    if 'vehicle_count_t' in results_cf.columns:
+        for traffic in results_cf['vehicle_count_t'].unique():
+            traffic_mask = results_cf['vehicle_count_t'] == traffic
+            mean_effect = results_cf.loc[traffic_mask, 'cate'].mean()
+            ci_lower = results_cf.loc[traffic_mask, 'cate_lower'].mean()
+            ci_upper = results_cf.loc[traffic_mask, 'cate_upper'].mean()
+            ranking_data.append({
+                'group': f"Traffic: {traffic}",
+                'effect': mean_effect,
+                'ci_lower': ci_lower,
+                'ci_upper': ci_upper
+            })
+    
+    # Sort by effect
+    ranking_df = pd.DataFrame(ranking_data)
+    ranking_df = ranking_df.sort_values('effect')
+    
+    print("Groups with Strongest Negative Effects (Most Beneficial):")
+    for i, (idx, row) in enumerate(ranking_df.head(5).iterrows(), 1):
+        print(f"{i:2d}. {row['group']:20s}: {row['effect']:.4f} [{row['ci_lower']:.4f}, {row['ci_upper']:.4f}]")
+    
+    print("\nGroups with Weakest Effects:")
+    for i, (idx, row) in enumerate(ranking_df.tail(5).iterrows(), 1):
+        print(f"{i:2d}. {row['group']:20s}: {row['effect']:.4f} [{row['ci_lower']:.4f}, {row['ci_upper']:.4f}]")
+    
+    # 12. Visualize uncertainty by group
+    print("\n12. UNCERTAINTY BY SUBGROUP (CI Width):")
+    print("-" * 50)
+    
+    # Calculate average CI width by zone type
+    if 'zone_type' in results_cf.columns:
+        zone_uncertainty = results_cf.groupby('zone_type')['ci_width'].agg(['mean', 'std', 'count'])
+        print("Uncertainty by Zone Type:")
+        for zone in zone_uncertainty.index:
+            print(f"  {zone:15s}: {zone_uncertainty.loc[zone, 'mean']:.4f} ± {zone_uncertainty.loc[zone, 'std']:.4f}")
+    
+    # Return both results and model
+    return results_cf, cf
+
+# Usage with the same format
+hte_cf_results, cf_model = get_hte_with_causal_forest(X_ready, Y_ready, T_ready, df_sampled)
+
+# Getting nuisance from Causal Forest
+---------------------------------------
+def get_nuisance_from_causal_forest(causal_forest, X, Y, T):
+    """
+    Try to extract nuisance models from fitted DML
+    """
+    print("Attempting to extract nuisance models from DML...")
+    
+    # Check if DML stores the models
+    if hasattr(causal_forest, 'models_y') and hasattr(causal_forest, 'models_t'):
+        print("✓ DML stores fitted nuisance models")
+        
+        # DML uses cross-fitting, so we have multiple models
+        print(f"  Found {len(causal_forest.models_y)} outcome models")
+        print(f"  Found {len(causal_forest.models_t)} treatment models")
+        
+        # Get predictions from all folds
+        all_y_preds = []
+        all_t_preds = []
+        
+        for i, (model_y, model_t) in enumerate(zip(causal_forest.models_y, causal_forest.models_t)):
+            # Get predictions for this fold
+            y_pred = causal_forest.predict(X)
+            if hasattr(model_t, 'predict_proba'):
+                t_pred = model_t.predict_proba(X)[:, 1]
+            else:
+                t_pred = model_t.predict(X)
+            
+            all_y_preds.append(y_pred)
+            all_t_preds.append(t_pred)
+        
+        # Average predictions (or use appropriate fold assignments)
+        y_pred_avg = np.mean(all_y_preds, axis=0)
+        t_pred_avg = np.mean(all_t_preds, axis=0)
+        
+        return y_pred_avg, t_pred_avg, causal_forest.models_y, causal_forest.models_t
+    
+    else:
+        print("✗ DML doesn't store fitted models directly")
+        return None, None, None, None
+
+
+def evaluate_nuisance_models_correctly(X, Y, T, n_splits=5):
+    """
+    Manually recreate DML's cross-fitting to evaluate nuisance models
+    """
+    from sklearn.metrics import mean_squared_error, r2_score, roc_auc_score, accuracy_score
+    
+    print(f"\nManually evaluating nuisance models with {n_splits}-fold CV:")
+    
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    
+    # Store metrics
+    mse_scores = []
+    r2_scores = []
+    auc_scores = []
+    acc_scores = []
+    
+    # Store predictions
+    y_preds = np.zeros_like(Y, dtype=float)
+    t_preds = np.zeros_like(T, dtype=float)
+    
+    fold = 0
+    for train_idx, test_idx in kf.split(X):
+        fold += 1
+        print(f"\n  Fold {fold}/{n_splits}:")
+        
+        # Split data
+        X_train, X_test = X[train_idx], X[test_idx]
+        Y_train, Y_test = Y[train_idx], Y[test_idx]
+        T_train, T_test = T[train_idx], T[test_idx]
+        
+        # Train outcome model
+        model_y = RandomForestRegressor(n_estimators=100, random_state=42)
+        model_y.fit(X_train, Y_train)
+        y_pred = model_y.predict(X_test)
+        
+        # Train treatment model
+        model_t = RandomForestClassifier(n_estimators=100, random_state=42)
+        model_t.fit(X_train, T_train)
+        t_pred_proba = model_t.predict_proba(X_test)[:, 1]
+        
+        # Store predictions
+        y_preds[test_idx] = y_pred
+        t_preds[test_idx] = t_pred_proba
+        
+        # Calculate metrics
+        mse = mean_squared_error(Y_test, y_pred)
+        r2 = r2_score(Y_test, y_pred)
+        auc = roc_auc_score(T_test, t_pred_proba)
+        acc = accuracy_score(T_test, t_pred_proba > 0.5)
+        
+        mse_scores.append(mse)
+        r2_scores.append(r2)
+        auc_scores.append(auc)
+        acc_scores.append(acc)
+        
+        print(f"    Outcome: MSE={mse:.3f}, R²={r2:.3f}")
+        print(f"    Treatment: AUC={auc:.3f}, Acc={acc:.3f}")
+    
+    # Overall metrics
+    print(f"\nOverall Nuisance Model Performance:")
+    print(f"  Outcome Model:")
+    print(f"    Mean MSE: {np.mean(mse_scores):.3f} (±{np.std(mse_scores):.3f})")
+    print(f"    Mean R²: {np.mean(r2_scores):.3f} (±{np.std(r2_scores):.3f})")
+    print(f"  Treatment Model:")
+    print(f"    Mean AUC: {np.mean(auc_scores):.3f} (±{np.std(auc_scores):.3f})")
+    print(f"    Mean Accuracy: {np.mean(acc_scores):.3f} (±{np.std(acc_scores):.3f})")
+    
+    return y_preds, t_preds
+
+cf = CausalForestDML(
+    model_y=RandomForestRegressor(n_estimators=100, random_state=42),
+    model_t=RandomForestClassifier(n_estimators=100, random_state=42),
+    n_estimators=100,
+    min_samples_leaf=10,
+    max_depth=20,
+    discrete_treatment=True,
+    random_state=42,
+    cv=3
+)
+
+cf.fit(Y_ready, T_ready, X=X_ready)
+
+# Manual cross-fitting evaluation
+print("="*60)
+print("Manual Cross-Fitting Evaluation")
+print("="*60)
+y_preds_cv, t_preds_cv = evaluate_nuisance_models_correctly(X_ready, Y_ready, T_ready, n_splits=5)
+
+#################################################################################
+3. REINFORCEMENT LEARNING WITH CAUSAL FOREST
+#################################################################################
+A. ALWAYS ACTIVE (CHECKING TOLL ACTIVATION)
+--------------------------------------------
+@dataclass
+class HTEParams:
+    """Store HTE parameters from causal analysis"""
+    # Zone types
+    residential: float = -0.5996
+    mixed: float = -0.8471
+    commercial: float = -1.2557
+    
+    # Traffic volume terciles
+    traffic_low: float = -0.5951
+    traffic_medium: float = -0.6629
+    traffic_high: float = -1.1130
+    
+    # Road quality quartiles
+    road_q1: float = -0.8578  # worst
+    road_q2: float = -0.7834
+    road_q3: float = -0.7723
+    road_q4: float = -0.7404  # best
+    
+    # Time effects
+    off_peak: float = -0.7909
+    peak: float = -0.7843
+    weekday: float = -0.7929
+    weekend: float = -0.7791
+    
+    # Conditions
+    no_rain: float = -0.7903
+    rain: float = -0.7799
+    no_event: float = -0.7895
+    event: float = -0.7833
+
+class State:
+    """State representation for toll optimization"""
+    def __init__(self, features: np.ndarray):
+        self.features = features
+        self._hash = None
+    
+    def __hash__(self):
+        if self._hash is None:
+            discretized = [
+                int(self.features[0] / 50),
+                round(self.features[1] * 2),
+                int(self.features[2]),
+                int(self.features[3]),
+                int(self.features[4]),
+                int(self.features[5]),
+                int(self.features[6]),
+                int(self.features[7]),
+            ]
+            self._hash = hash(tuple(discretized))
+        return self._hash
+    
+    def __eq__(self, other):
+        return hash(self) == hash(other)
+    
+    def get_features(self) -> np.ndarray:
+        return self.features
+
+class MDP:
+    """Markov Decision Process for toll optimization"""
+    def __init__(self, hte_params: HTEParams, implementation_cost: float = 0.05):
+        self.hte = hte_params
+        self.gamma = 0.95
+        self.implementation_cost = implementation_cost
+        
+    def reward_function(self, state: State, action: int) -> float:
+        """R(s,a) based on HTE"""
+        if action == 0:
+            return 0.0
+        
+        vehicle_count, road_quality, hour, is_peak, is_weekend, rain, event, zone_type = state.features
+        
+        # Base CATE
+        if zone_type == 0:
+            base_cate = self.hte.residential
+        elif zone_type == 1:
+            base_cate = self.hte.mixed
+        else:
+            base_cate = self.hte.commercial
+        
+        # Additive adjustments (FIXED version)
+        adjustments = 0.0
+        
+        # Traffic adjustment
+        if vehicle_count > 350:
+            adjustments += (self.hte.traffic_high - self.hte.traffic_low)
+        elif vehicle_count > 200:
+            adjustments += (self.hte.traffic_medium - self.hte.traffic_low)
+        
+        # Road quality adjustment
+        if road_quality < 0.75:
+            adjustments += (self.hte.road_q1 - self.hte.road_q4)
+        elif road_quality < 1.25:
+            adjustments += (((self.hte.road_q2 + self.hte.road_q3) / 2) - self.hte.road_q4)
+        
+        # Time adjustments
+        if is_peak:
+            adjustments += (self.hte.peak - self.hte.off_peak) * 0.3
+        
+        if is_weekend:
+            adjustments += (self.hte.weekend - self.hte.weekday) * 0.3
+        
+        # Condition adjustments
+        if rain:
+            adjustments += (self.hte.rain - self.hte.no_rain) * 0.2
+        
+        if event:
+            adjustments += (self.hte.event - self.hte.no_event) * 0.2
+        
+        combined_cate = base_cate + adjustments
+        
+        # Reward = -CATE - cost
+        return -combined_cate - self.implementation_cost
+
+# ============================================================================
+# RL ALGORITHMS (BOTH Q-LEARNING AND SARSA)
+# ============================================================================
+
+class RLAlgorithm(ABC):
+    @abstractmethod
+    def select_action(self, state: State) -> int:
+        pass
+    
+    @abstractmethod
+    def update(self, state: State, action: int, reward: float, next_state: State) -> None:
+        pass
+    
+    @abstractmethod
+    def get_value(self, state: State, action: Optional[int] = None) -> float:
+        pass
+
+class QLearning(RLAlgorithm):
+    """Q-Learning algorithm"""
+    def __init__(self, mdp: MDP, alpha: float = 0.1, epsilon: float = 0.1):
+        self.mdp = mdp
+        self.alpha = alpha
+        self.epsilon = epsilon
+        self.q_table: Dict[Tuple[int, int], float] = {}
+        
+    def _get_q_key(self, state: State, action: int) -> Tuple[int, int]:
+        return (hash(state), action)
+    
+    def select_action(self, state: State) -> int:
+        if np.random.random() < self.epsilon:
+            return np.random.randint(0, 2)
+        
+        q0 = self.get_value(state, 0)
+        q1 = self.get_value(state, 1)
+        return 0 if q0 > q1 else 1
+    
+    def get_value(self, state: State, action: Optional[int] = None) -> float:
+        if action is not None:
+            key = self._get_q_key(state, action)
+            return self.q_table.get(key, 0.0)
+        else:
+            q0 = self.get_value(state, 0)
+            q1 = self.get_value(state, 1)
+            return max(q0, q1)
+    
+    def update(self, state: State, action: int, reward: float, next_state: State) -> None:
+        current_q = self.get_value(state, action)
+        
+        next_q0 = self.get_value(next_state, 0)
+        next_q1 = self.get_value(next_state, 1)
+        max_next_q = max(next_q0, next_q1)
+        
+        new_q = current_q + self.alpha * (reward + self.mdp.gamma * max_next_q - current_q)
+        
+        key = self._get_q_key(state, action)
+        self.q_table[key] = new_q
+
+class SARSA(RLAlgorithm):
+    """SARSA algorithm"""
+    def __init__(self, mdp: MDP, alpha: float = 0.1, epsilon: float = 0.1):
+        self.mdp = mdp
+        self.alpha = alpha
+        self.epsilon = epsilon
+        self.q_table: Dict[Tuple[int, int], float] = {}
+        
+    def _get_q_key(self, state: State, action: int) -> Tuple[int, int]:
+        return (hash(state), action)
+    
+    def select_action(self, state: State) -> int:
+        if np.random.random() < self.epsilon:
+            return np.random.randint(0, 2)
+        
+        q0 = self.get_value(state, 0)
+        q1 = self.get_value(state, 1)
+        return 0 if q0 > q1 else 1
+    
+    def get_value(self, state: State, action: Optional[int] = None) -> float:
+        if action is not None:
+            key = self._get_q_key(state, action)
+            return self.q_table.get(key, 0.0)
+        else:
+            q0 = self.get_value(state, 0)
+            q1 = self.get_value(state, 1)
+            return max(q0, q1)
+    
+    def update(self, state: State, action: int, reward: float, next_state: State) -> None:
+        # SARSA requires next action
+        pass
+    
+    def update_with_next_action(self, state: State, action: int, reward: float, 
+                               next_state: State, next_action: int) -> None:
+        current_q = self.get_value(state, action)
+        next_q = self.get_value(next_state, next_action)
+        
+        new_q = current_q + self.alpha * (reward + self.mdp.gamma * next_q - current_q)
+        
+        key = self._get_q_key(state, action)
+        self.q_table[key] = new_q
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def prepare_states_from_data(df: pd.DataFrame) -> List[State]:
+    """Convert dataframe rows to State objects"""
+    states = []
+    
+    for _, row in df.iterrows():
+        if row['zone_type'] == 'residential':
+            zone_code = 0
+        elif row['zone_type'] == 'mixed':
+            zone_code = 1
+        else:
+            zone_code = 2
+        
+        features = np.array([
+            row['vehicle_count'],
+            row['road_quality'],
+            row['hour'],
+            row['is_peak'],
+            row['is_weekend'],
+            row['rain'],
+            row['event'],
+            zone_code
+        ], dtype=np.float32)
+        
+        states.append(State(features))
+    
+    return states
+
+def analyze_policy_by_features(agent: RLAlgorithm, states: List[State], 
+                              df: pd.DataFrame) -> Dict:
+    """Analyze learned policy across different feature dimensions"""
+    zone_groups = {'residential': [], 'mixed': [], 'commercial': []}
+    time_groups = {'peak': [], 'off_peak': []}
+    traffic_groups = {'low': [], 'medium': [], 'high': []}
+    
+    for i, state in enumerate(states[:1000]):
+        if i >= len(df):
+            break
+            
+        action = agent.select_action(state)
+        row = df.iloc[i]
+        
+        # Zone type - ALL THREE CATEGORIES
+        zone_groups[row['zone_type']].append(action)
+        
+        # Time
+        time_key = 'peak' if row['is_peak'] else 'off_peak'
+        time_groups[time_key].append(action)
+        
+        # Traffic
+        if row['vehicle_count'] > 350:
+            traffic_key = 'high'
+        elif row['vehicle_count'] > 200:
+            traffic_key = 'medium'
+        else:
+            traffic_key = 'low'
+        traffic_groups[traffic_key].append(action)
+    
+    return {
+        'zone_activation': {zone: np.mean(actions) if actions else 0 
+                          for zone, actions in zone_groups.items()},
+        'time_activation': {time: np.mean(actions) if actions else 0
+                          for time, actions in time_groups.items()},
+        'traffic_activation': {traffic: np.mean(actions) if actions else 0
+                             for traffic, actions in traffic_groups.items()}
+    }
+
+# ============================================================================
+# RUN EXPERIMENTS
+# ============================================================================
+
+def run_experiment(df: pd.DataFrame, algorithm: str = 'qlearning', 
+                  episodes: int = 100) -> Dict:
+    """Run RL experiment with either Q-learning or SARSA"""
+    print(f"\n{'='*70}")
+    print(f"RUNNING: {algorithm.upper()}")
+    print('='*70)
+    
+    states = prepare_states_from_data(df)
+    hte_params = HTEParams()
+    mdp = MDP(hte_params)
+    
+    # Initialize algorithm
+    if algorithm.lower() == 'qlearning':
+        agent = QLearning(mdp, alpha=0.1, epsilon=0.1)
+    else:  # sarsa
+        agent = SARSA(mdp, alpha=0.1, epsilon=0.1)
+    
+    # Training
+    episode_rewards = []
+    q_history = []
+    
+    for episode in range(episodes):
+        total_reward = 0
+        states_perm = np.random.permutation(states[:1000])
+        
+        for i in range(len(states_perm) - 1):
+            state = states_perm[i]
+            next_state = states_perm[i + 1]
+            
+            action = agent.select_action(state)
+            reward = mdp.reward_function(state, action)
+            total_reward += reward
+            
+            if algorithm.lower() == 'qlearning':
+                agent.update(state, action, reward, next_state)
+            else:  # sarsa
+                next_action = agent.select_action(next_state)
+                agent.update_with_next_action(state, action, reward, next_state, next_action)
+        
+        episode_rewards.append(total_reward)
+        
+        if episode % 10 == 0:
+            q_history.append(agent.q_table.copy())
+        
+        if (episode + 1) % 20 == 0:
+            print(f"Episode {episode + 1}/{episodes}, Reward: {total_reward:.2f}")
+    
+    # Evaluate policy
+    total_reward = 0
+    actions_taken = []
+    
+    for i in range(len(states[:2000]) - 1):
+        state = states[i]
+        action = agent.select_action(state)
+        reward = mdp.reward_function(state, action)
+        total_reward += reward
+        actions_taken.append(action)
+    
+    avg_reward = total_reward / len(actions_taken) if actions_taken else 0
+    
+    # Policy analysis
+    policy_analysis = analyze_policy_by_features(agent, states[:2000], df)
+    
+    return {
+        'algorithm': algorithm,
+        'episode_rewards': episode_rewards,
+        'final_evaluation': {
+            'total_reward': total_reward,
+            'avg_reward': avg_reward,
+            'toll_activation_rate': np.mean(actions_taken)
+        },
+        'policy_analysis': policy_analysis,
+        'q_table_size': len(agent.q_table),
+        'agent': agent
+    }
+
+# ============================================================================
+# PLOTTING FUNCTION
+# ============================================================================
+
+def plot_comparison_results(qlearning_results, sarsa_results, df):
+    """Create comprehensive comparison plots for both algorithms"""
+    
+    fig = plt.figure(figsize=(18, 12))
+    
+    # 1. Learning curves comparison
+    ax1 = plt.subplot(3, 3, 1)
+    episodes = range(len(qlearning_results['episode_rewards']))
+    ax1.plot(episodes, qlearning_results['episode_rewards'], 
+             label='Q-learning', linewidth=2, color='blue')
+    ax1.plot(episodes, sarsa_results['episode_rewards'], 
+             label='SARSA', linewidth=2, color='orange')
+    ax1.set_xlabel('Episode')
+    ax1.set_ylabel('Total Reward')
+    ax1.set_title('A. Learning Curves Comparison')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. Zone activation comparison
+    ax2 = plt.subplot(3, 3, 2)
+    zones = ['Residential', 'Mixed', 'Commercial']  # ALL THREE
+    ql_zone_rates = [qlearning_results['policy_analysis']['zone_activation'][z] 
+                     for z in ['residential', 'mixed', 'commercial']]  # ALL THREE
+    sarsa_zone_rates = [sarsa_results['policy_analysis']['zone_activation'][z] 
+                        for z in ['residential', 'mixed', 'commercial']]  # ALL THREE
+    
+    x = np.arange(len(zones))
+    width = 0.35
+    bars1 = ax2.bar(x - width/2, ql_zone_rates, width, label='Q-learning', 
+                    color=['lightblue', 'orange', 'darkred'], alpha=0.7)
+    bars2 = ax2.bar(x + width/2, sarsa_zone_rates, width, label='SARSA', 
+                    color=['lightblue', 'orange', 'darkred'], alpha=0.7)
+    
+    ax2.set_ylabel('Toll Activation Rate')
+    ax2.set_title('B. Zone Type Activation (All Three)')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(zones)
+    ax2.legend()
+    ax2.set_ylim(0, 1)
+    
+    # Add value labels
+    for i, (ql_rate, sarsa_rate) in enumerate(zip(ql_zone_rates, sarsa_zone_rates)):
+        ax2.text(i - width/2, ql_rate + 0.02, f'{ql_rate:.1%}', 
+                ha='center', va='bottom', fontsize=9)
+        ax2.text(i + width/2, sarsa_rate + 0.02, f'{sarsa_rate:.1%}', 
+                ha='center', va='bottom', fontsize=9)
+    
+    # 3. Traffic activation comparison
+    ax3 = plt.subplot(3, 3, 3)
+    traffic_levels = ['Low', 'Medium', 'High']
+    ql_traffic_rates = [qlearning_results['policy_analysis']['traffic_activation'][z] 
+                        for z in ['low', 'medium', 'high']]
+    sarsa_traffic_rates = [sarsa_results['policy_analysis']['traffic_activation'][z] 
+                           for z in ['low', 'medium', 'high']]
+    
+    x = np.arange(len(traffic_levels))
+    bars1 = ax3.bar(x - width/2, ql_traffic_rates, width, label='Q-learning', color='blue', alpha=0.7)
+    bars2 = ax3.bar(x + width/2, sarsa_traffic_rates, width, label='SARSA', color='orange', alpha=0.7)
+    
+    ax3.set_ylabel('Toll Activation Rate')
+    ax3.set_title('C. Traffic Volume Activation')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(traffic_levels)
+    ax3.legend()
+    ax3.set_ylim(0, 1)
+    
+    # 4. Time activation comparison
+    ax4 = plt.subplot(3, 3, 4)
+    times = ['Off-Peak', 'Peak']
+    ql_time_rates = [qlearning_results['policy_analysis']['time_activation'][z] 
+                     for z in ['off_peak', 'peak']]
+    sarsa_time_rates = [sarsa_results['policy_analysis']['time_activation'][z] 
+                        for z in ['off_peak', 'peak']]
+    
+    x = np.arange(len(times))
+    bars1 = ax4.bar(x - width/2, ql_time_rates, width, label='Q-learning', color='blue', alpha=0.7)
+    bars2 = ax4.bar(x + width/2, sarsa_time_rates, width, label='SARSA', color='orange', alpha=0.7)
+    
+    ax4.set_ylabel('Toll Activation Rate')
+    ax4.set_title('D. Time Period Activation')
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(times)
+    ax4.legend()
+    ax4.set_ylim(0, 1)
+    
+    # 5. Q-value distribution comparison
+    ax5 = plt.subplot(3, 3, 5)
+    if hasattr(qlearning_results['agent'], 'q_table') and hasattr(sarsa_results['agent'], 'q_table'):
+        ql_q_values = list(qlearning_results['agent'].q_table.values())
+        sarsa_q_values = list(sarsa_results['agent'].q_table.values())
+        
+        if ql_q_values and sarsa_q_values:
+            ax5.hist(ql_q_values, bins=30, alpha=0.5, label='Q-learning', 
+                    color='blue', density=True, edgecolor='black')
+            ax5.hist(sarsa_q_values, bins=30, alpha=0.5, label='SARSA', 
+                    color='orange', density=True, edgecolor='black')
+            ax5.set_xlabel('Q-value')
+            ax5.set_ylabel('Density')
+            ax5.set_title('E. Q-value Distribution')
+            ax5.legend()
+    
+    # 6. Performance metrics comparison
+    ax6 = plt.subplot(3, 3, 6)
+    metrics = ['Avg Reward', 'Toll Rate', 'Q-table Size']
+    ql_metrics = [
+        qlearning_results['final_evaluation']['avg_reward'],
+        qlearning_results['final_evaluation']['toll_activation_rate'],
+        qlearning_results['q_table_size'] / 1000
+    ]
+    sarsa_metrics = [
+        sarsa_results['final_evaluation']['avg_reward'],
+        sarsa_results['final_evaluation']['toll_activation_rate'],
+        sarsa_results['q_table_size'] / 1000
+    ]
+    
+    x = np.arange(len(metrics))
+    bars1 = ax6.bar(x - width/2, ql_metrics, width, label='Q-learning', color='blue', alpha=0.7)
+    bars2 = ax6.bar(x + width/2, sarsa_metrics, width, label='SARSA', color='orange', alpha=0.7)
+    
+    ax6.set_ylabel('Value')
+    ax6.set_title('F. Performance Metrics')
+    ax6.set_xticks(x)
+    ax6.set_xticklabels(metrics, rotation=45, ha='right')
+    ax6.legend()
+    
+    # Add value labels
+    for i, (ql_val, sarsa_val) in enumerate(zip(ql_metrics, sarsa_metrics)):
+        ax6.text(i - width/2, ql_val + 0.01, f'{ql_val:.3f}' if i != 2 else f'{ql_val:.1f}K', 
+                ha='center', va='bottom', fontsize=8)
+        ax6.text(i + width/2, sarsa_val + 0.01, f'{sarsa_val:.3f}' if i != 2 else f'{sarsa_val:.1f}K', 
+                ha='center', va='bottom', fontsize=8)
+    
+    # 7. Convergence analysis
+    ax7 = plt.subplot(3, 3, 7)
+    ql_smooth = pd.Series(qlearning_results['episode_rewards']).rolling(window=5, center=True).mean()
+    sarsa_smooth = pd.Series(sarsa_results['episode_rewards']).rolling(window=5, center=True).mean()
+    
+    ax7.plot(episodes, ql_smooth, label='Q-learning (smoothed)', linewidth=2, color='blue', alpha=0.7)
+    ax7.plot(episodes, sarsa_smooth, label='SARSA (smoothed)', linewidth=2, color='orange', alpha=0.7)
+    ax7.set_xlabel('Episode')
+    ax7.set_ylabel('Smoothed Reward')
+    ax7.set_title('G. Convergence Analysis (Smoothed)')
+    ax7.legend()
+    ax7.grid(True, alpha=0.3)
+    
+    # 8. Policy similarity heatmap
+    ax8 = plt.subplot(3, 3, 8)
+    
+    # Sample decisions for comparison
+    sample_df = df.sample(500, random_state=42)
+    sample_states = prepare_states_from_data(sample_df)
+    
+    agreements = []
+    for i, state in enumerate(sample_states):
+        ql_action = qlearning_results['agent'].select_action(state)
+        sarsa_action = sarsa_results['agent'].select_action(state)
+        agreements.append(1 if ql_action == sarsa_action else 0)
+    
+    agreement_rate = np.mean(agreements)
+    
+    categories = ['Overall\nAgreement', 'Zone\nAgreement', 'Traffic\nAgreement', 'Time\nAgreement']
+    rates = [
+        agreement_rate,
+        np.mean([abs(ql_zone_rates[i] - sarsa_zone_rates[i]) < 0.05 for i in range(3)]),
+        np.mean([abs(ql_traffic_rates[i] - sarsa_traffic_rates[i]) < 0.05 for i in range(3)]),
+        np.mean([abs(ql_time_rates[i] - sarsa_time_rates[i]) < 0.05 for i in range(2)])
+    ]
+    
+    colors = plt.cm.RdYlGn(rates)
+    bars = ax8.bar(categories, rates, color=colors)
+    ax8.set_ylabel('Agreement Rate')
+    ax8.set_title('H. Policy Agreement Analysis')
+    ax8.set_ylim(0, 1)
+    
+    for bar, rate in zip(bars, rates):
+        ax8.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02, 
+                f'{rate:.1%}', ha='center', va='bottom', fontsize=9)
+    
+    # 9. Summary statistics - FIXED VERSION
+    ax9 = plt.subplot(3, 3, 9)
+    ax9.axis('off')
+    
+    ql_reward = qlearning_results['final_evaluation']['avg_reward']
+    sarsa_reward = sarsa_results['final_evaluation']['avg_reward']
+    improvement = (sarsa_reward - ql_reward) / ql_reward * 100 if ql_reward != 0 else 0
+    
+    # Determine which algorithm is better
+    algorithm_name = "SARSA" if sarsa_reward > ql_reward else "Q-learning"
+    
+    summary_text = (
+        f"COMPARISON SUMMARY:\n\n"
+        f"SARSA vs Q-learning:\n"
+        f"• Reward: {improvement:+.1f}%\n"
+        f"• Q-table size: {sarsa_results['q_table_size']:,} vs {qlearning_results['q_table_size']:,}\n"
+        f"• Policy agreement: {agreement_rate:.1%}\n\n"
+        
+        f"KEY FINDINGS:\n"
+        f"1. {algorithm_name} achieves higher average reward\n"
+        f"2. Both learn similar activation patterns\n"
+        f"3. Commercial zones: {max(ql_zone_rates[2], sarsa_zone_rates[2]):.1%} activation\n"
+        f"4. High traffic: {max(ql_traffic_rates[2], sarsa_traffic_rates[2]):.1%} activation\n"
+    )
+    
+    ax9.text(0.1, 0.5, summary_text, fontsize=10, 
+             verticalalignment='center', fontfamily='monospace')
+    
+    plt.suptitle('Comprehensive RL Algorithm Comparison: Q-learning vs SARSA for Toll Optimization', 
+                fontsize=16, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.show()
+    
+    return {
+        'agreement_rate': agreement_rate,
+        'improvement_percentage': improvement,
+        'ql_reward': ql_reward,
+        'sarsa_reward': sarsa_reward,
+        'better_algorithm': algorithm_name
+    }
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def main():
+    """Main execution function"""
+    print("="*80)
+    print("REINFORCEMENT LEARNING WITH HETEROGENEOUS TREATMENT EFFECTS")
+    print("Q-LEARNING vs SARSA COMPARISON")
+    print("="*80)
+    
+    # Create synthetic data
+    np.random.seed(42)
+    n_samples = 5000
+    dummy_data = {
+        'vehicle_count': np.random.randint(50, 500, n_samples),
+        'road_quality': np.random.uniform(0.5, 2.0, n_samples),
+        'hour': np.random.randint(0, 24, n_samples),
+        'is_peak': np.random.binomial(1, 0.3, n_samples),
+        'is_weekend': np.random.binomial(1, 0.2, n_samples),
+        'rain': np.random.binomial(1, 0.1, n_samples),
+        'event': np.random.binomial(1, 0.05, n_samples),
+        'zone_type': np.random.choice(['residential', 'mixed', 'commercial'], 
+                                     n_samples, p=[0.4, 0.3, 0.3])
+    }
+    df = pd.DataFrame(dummy_data)
+    
+    # Run Q-learning
+    print("\n" + "="*70)
+    print("TRAINING Q-LEARNING")
+    print("="*70)
+    qlearning_results = run_experiment(df, algorithm='qlearning', episodes=100)
+    
+    # Run SARSA
+    print("\n" + "="*70)
+    print("TRAINING SARSA")
+    print("="*70)
+    sarsa_results = run_experiment(df, algorithm='sarsa', episodes=100)
+    
+    # Compare results
+    print("\n" + "="*70)
+    print("COMPARISON RESULTS")
+    print("="*70)
+    
+    comparison_data = []
+    for results in [qlearning_results, sarsa_results]:
+        eval_stats = results['final_evaluation']
+        comparison_data.append({
+            'Algorithm': results['algorithm'].upper(),
+            'Avg Reward': f"{eval_stats['avg_reward']:.3f}",
+            'Toll Rate': f"{eval_stats['toll_activation_rate']:.2%}",
+            'Q-table Size': f"{results['q_table_size']:,}"
+        })
+    
+    comparison_df = pd.DataFrame(comparison_data)
+    print(comparison_df.to_string(index=False))
+    
+    # Statistical test
+    print("\nSTATISTICAL SIGNIFICANCE TEST:")
+    ql_rewards = qlearning_results['episode_rewards'][-20:]  # Last 20 episodes
+    sarsa_rewards = sarsa_results['episode_rewards'][-20:]
+    
+    t_stat, p_value = stats.ttest_ind(ql_rewards, sarsa_rewards)
+    print(f"Independent t-test: t = {t_stat:.3f}, p = {p_value:.4f}")
+    print(f"Significant difference: {'YES' if p_value < 0.05 else 'NO'}")
+    
+    # Create comprehensive plots
+    print("\n" + "="*70)
+    print("GENERATING COMPREHENSIVE PLOTS")
+    print("="*70)
+    
+    plot_results = plot_comparison_results(qlearning_results, sarsa_results, df)
+    
+    # Get zone activation rates
+    ql_zone_rates = [qlearning_results['policy_analysis']['zone_activation'][z] 
+                     for z in ['residential', 'mixed', 'commercial']]
+    sarsa_zone_rates = [sarsa_results['policy_analysis']['zone_activation'][z] 
+                        for z in ['residential', 'mixed', 'commercial']]
+    
+    ql_traffic_rates = [qlearning_results['policy_analysis']['traffic_activation'][z] 
+                        for z in ['low', 'medium', 'high']]
+    sarsa_traffic_rates = [sarsa_results['policy_analysis']['traffic_activation'][z] 
+                           for z in ['low', 'medium', 'high']]
+
+    
+    return {
+        'qlearning': qlearning_results,
+        'sarsa': sarsa_results,
+        'comparison': comparison_df,
+        'plot_results': plot_results,
+        'p_value': p_value,
+        't_statistic': t_stat
+    }
+
+# Execute
+if __name__ == "__main__":
+    results = main()
+
+B. ZONE SPECIFIC TOLL ACTIVATION
+---------------------------------
+@dataclass
+class HTEParams:
+    """Store HTE parameters from causal analysis"""
+    # Zone types
+    residential: float = -0.5996
+    mixed: float = -0.8471
+    commercial: float = -1.2557
+    
+    # Traffic volume terciles
+    traffic_low: float = -0.5951
+    traffic_medium: float = -0.6629
+    traffic_high: float = -1.1130
+    
+    # Road quality quartiles
+    road_q1: float = -0.8578  # worst
+    road_q2: float = -0.7834
+    road_q3: float = -0.7723
+    road_q4: float = -0.7404  # best
+    
+    # Time effects
+    off_peak: float = -0.7909
+    peak: float = -0.7843
+    weekday: float = -0.7929
+    weekend: float = -0.7791
+    
+    # Conditions
+    no_rain: float = -0.7903
+    rain: float = -0.7799
+    no_event: float = -0.7895
+    event: float = -0.7833
+
+class State:
+    """State representation for toll optimization"""
+    def __init__(self, features: np.ndarray):
+        self.features = features
+        self._hash = None
+    
+    def __hash__(self):
+        if self._hash is None:
+            discretized = [
+                int(self.features[0] / 50),
+                round(self.features[1] * 2),
+                int(self.features[2]),
+                int(self.features[3]),
+                int(self.features[4]),
+                int(self.features[5]),
+                int(self.features[6]),
+                int(self.features[7]),
+            ]
+            self._hash = hash(tuple(discretized))
+        return self._hash
+    
+    def __eq__(self, other):
+        return hash(self) == hash(other)
+    
+    def get_features(self) -> np.ndarray:
+        return self.features
+    
+    def get_zone_type(self) -> int:
+        """Get zone type as integer"""
+        return int(self.features[7])
+
+class MDP:
+    """Markov Decision Process for toll optimization with zone-specific toll levels"""
+    def __init__(self, hte_params: HTEParams, implementation_cost: float = 0.05):
+        self.hte = hte_params
+        self.gamma = 0.95
+        self.implementation_cost = implementation_cost
+        
+        # Define toll levels for each zone type
+        # action structure: (zone_type, toll_level)
+        # toll_level: 0=no toll, 1=low toll, 2=medium toll, 3=high toll
+        self.toll_levels = {
+            # Zone type: [no_toll, low_toll, medium_toll, high_toll]
+            0: [0.0, 0.5, 1.0, 1.5],    # Residential
+            1: [0.0, 1.0, 2.0, 3.0],    # Mixed
+            2: [0.0, 2.0, 4.0, 6.0]     # Commercial
+        }
+        
+        # Toll effectiveness multiplier (how toll amount affects CATE)
+        self.toll_multiplier = 0.3
+    
+    def get_action_space_size(self, zone_type: Optional[int] = None) -> int:
+        """Get number of actions (toll levels) for a zone type"""
+        return 4  # 0: no toll, 1-3: toll levels
+    
+    def get_toll_amount(self, zone_type: int, action: int) -> float:
+        """Get the toll amount for a given zone type and action"""
+        return self.toll_levels[zone_type][action]
+    
+    def reward_function(self, state: State, action: int) -> float:
+        """R(s,a) based on HTE with toll amount consideration"""
+        zone_type = state.get_zone_type()
+        toll_amount = self.get_toll_amount(zone_type, action)
+        
+        # If no toll, return 0
+        if action == 0:
+            return 0.0
+        
+        vehicle_count, road_quality, hour, is_peak, is_weekend, rain, event, _ = state.features
+        
+        # Base CATE
+        if zone_type == 0:
+            base_cate = self.hte.residential
+        elif zone_type == 1:
+            base_cate = self.hte.mixed
+        else:
+            base_cate = self.hte.commercial
+        
+        # Additive adjustments
+        adjustments = 0.0
+        
+        # Traffic adjustment
+        if vehicle_count > 350:
+            adjustments += (self.hte.traffic_high - self.hte.traffic_low)
+        elif vehicle_count > 200:
+            adjustments += (self.hte.traffic_medium - self.hte.traffic_low)
+        
+        # Road quality adjustment
+        if road_quality < 0.75:
+            adjustments += (self.hte.road_q1 - self.hte.road_q4)
+        elif road_quality < 1.25:
+            adjustments += (((self.hte.road_q2 + self.hte.road_q3) / 2) - self.hte.road_q4)
+        
+        # Time adjustments
+        if is_peak:
+            adjustments += (self.hte.peak - self.hte.off_peak) * 0.3
+        
+        if is_weekend:
+            adjustments += (self.hte.weekend - self.hte.weekday) * 0.3
+        
+        # Condition adjustments
+        if rain:
+            adjustments += (self.hte.rain - self.hte.no_rain) * 0.2
+        
+        if event:
+            adjustments += (self.hte.event - self.hte.no_event) * 0.2
+        
+        combined_cate = base_cate + adjustments
+        
+        # Apply toll amount multiplier (higher tolls have stronger effect)
+        toll_effect = combined_cate * (1 + self.toll_multiplier * (action / 3))
+        
+        # Revenue from toll (proportional to toll amount and vehicle count)
+        revenue = toll_amount * vehicle_count / 1000
+        
+        # Cost includes implementation cost and potential negative effects
+        cost = self.implementation_cost * (1 + toll_amount / 2)
+        
+        # Reward = positive effect + revenue - cost
+        # (Note: CATE is negative, so we take negative of it for positive effect)
+        reward = (-toll_effect * 10) + revenue - cost
+        
+        return reward
+
+# ============================================================================
+# RL ALGORITHMS (BOTH Q-LEARNING AND SARSA)
+# ============================================================================
+
+class RLAlgorithm(ABC):
+    @abstractmethod
+    def select_action(self, state: State) -> int:
+        pass
+    
+    @abstractmethod
+    def update(self, state: State, action: int, reward: float, next_state: State) -> None:
+        pass
+    
+    @abstractmethod
+    def get_value(self, state: State, action: Optional[int] = None) -> float:
+        pass
+    
+    def get_policy_for_zone(self, zone_type: int) -> Dict[int, float]:
+        """Get action distribution for a specific zone type"""
+        pass
+
+class QLearning(RLAlgorithm):
+    """Q-Learning algorithm with zone-specific toll levels"""
+    def __init__(self, mdp: MDP, alpha: float = 0.1, epsilon: float = 0.1):
+        self.mdp = mdp
+        self.alpha = alpha
+        self.epsilon = epsilon
+        self.q_table: Dict[Tuple[int, int], float] = {}
+        
+    def _get_q_key(self, state: State, action: int) -> Tuple[int, int]:
+        return (hash(state), action)
+    
+    def select_action(self, state: State) -> int:
+        if np.random.random() < self.epsilon:
+            # Random action within valid range
+            return np.random.randint(0, self.mdp.get_action_space_size())
+        
+        # Find best action for this state
+        zone_type = state.get_zone_type()
+        best_action = 0
+        best_value = float('-inf')
+        
+        for action in range(self.mdp.get_action_space_size()):
+            q_value = self.get_value(state, action)
+            if q_value > best_value:
+                best_value = q_value
+                best_action = action
+        
+        return best_action
+    
+    def get_value(self, state: State, action: Optional[int] = None) -> float:
+        if action is not None:
+            key = self._get_q_key(state, action)
+            return self.q_table.get(key, 0.0)
+        else:
+            zone_type = state.get_zone_type()
+            best_value = float('-inf')
+            for action in range(self.mdp.get_action_space_size()):
+                q_value = self.get_value(state, action)
+                if q_value > best_value:
+                    best_value = q_value
+            return best_value
+    
+    def update(self, state: State, action: int, reward: float, next_state: State) -> None:
+        current_q = self.get_value(state, action)
+        
+        # Get max Q for next state
+        max_next_q = self.get_value(next_state)
+        
+        new_q = current_q + self.alpha * (reward + self.mdp.gamma * max_next_q - current_q)
+        
+        key = self._get_q_key(state, action)
+        self.q_table[key] = new_q
+    
+    def get_policy_for_zone(self, zone_type: int, sample_states: List[State]) -> Dict[int, float]:
+        """Get action distribution for a specific zone type"""
+        zone_states = [s for s in sample_states if s.get_zone_type() == zone_type]
+        if not zone_states:
+            return {}
+        
+        action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+        
+        for state in zone_states:
+            action = self.select_action(state)
+            action_counts[action] += 1
+        
+        total = len(zone_states)
+        return {action: count / total for action, count in action_counts.items()}
+
+class SARSA(RLAlgorithm):
+    """SARSA algorithm with zone-specific toll levels"""
+    def __init__(self, mdp: MDP, alpha: float = 0.1, epsilon: float = 0.1):
+        self.mdp = mdp
+        self.alpha = alpha
+        self.epsilon = epsilon
+        self.q_table: Dict[Tuple[int, int], float] = {}
+        
+    def _get_q_key(self, state: State, action: int) -> Tuple[int, int]:
+        return (hash(state), action)
+    
+    def select_action(self, state: State) -> int:
+        if np.random.random() < self.epsilon:
+            # Random action within valid range
+            return np.random.randint(0, self.mdp.get_action_space_size())
+        
+        # Find best action for this state
+        zone_type = state.get_zone_type()
+        best_action = 0
+        best_value = float('-inf')
+        
+        for action in range(self.mdp.get_action_space_size()):
+            q_value = self.get_value(state, action)
+            if q_value > best_value:
+                best_value = q_value
+                best_action = action
+        
+        return best_action
+    
+    def get_value(self, state: State, action: Optional[int] = None) -> float:
+        if action is not None:
+            key = self._get_q_key(state, action)
+            return self.q_table.get(key, 0.0)
+        else:
+            zone_type = state.get_zone_type()
+            best_value = float('-inf')
+            for action in range(self.mdp.get_action_space_size()):
+                q_value = self.get_value(state, action)
+                if q_value > best_value:
+                    best_value = q_value
+            return best_value
+    
+    def update(self, state: State, action: int, reward: float, next_state: State) -> None:
+        # SARSA requires next action
+        pass
+    
+    def update_with_next_action(self, state: State, action: int, reward: float, 
+                               next_state: State, next_action: int) -> None:
+        current_q = self.get_value(state, action)
+        next_q = self.get_value(next_state, next_action)
+        
+        new_q = current_q + self.alpha * (reward + self.mdp.gamma * next_q - current_q)
+        
+        key = self._get_q_key(state, action)
+        self.q_table[key] = new_q
+    
+    def get_policy_for_zone(self, zone_type: int, sample_states: List[State]) -> Dict[int, float]:
+        """Get action distribution for a specific zone type"""
+        zone_states = [s for s in sample_states if s.get_zone_type() == zone_type]
+        if not zone_states:
+            return {}
+        
+        action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+        
+        for state in zone_states:
+            action = self.select_action(state)
+            action_counts[action] += 1
+        
+        total = len(zone_states)
+        return {action: count / total for action, count in action_counts.items()}
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def prepare_states_from_data(df: pd.DataFrame) -> List[State]:
+    """Convert dataframe rows to State objects"""
+    states = []
+    
+    for _, row in df.iterrows():
+        if row['zone_type'] == 'residential':
+            zone_code = 0
+        elif row['zone_type'] == 'mixed':
+            zone_code = 1
+        else:
+            zone_code = 2
+        
+        features = np.array([
+            row['vehicle_count'],
+            row['road_quality'],
+            row['hour'],
+            row['is_peak'],
+            row['is_weekend'],
+            row['rain'],
+            row['event'],
+            zone_code
+        ], dtype=np.float32)
+        
+        states.append(State(features))
+    
+    return states
+
+def analyze_policy_by_features(agent: RLAlgorithm, states: List[State], 
+                              df: pd.DataFrame, mdp: MDP) -> Dict:
+    """Analyze learned policy across different feature dimensions"""
+    zone_groups = {'residential': [], 'mixed': [], 'commercial': []}
+    time_groups = {'peak': [], 'off_peak': []}
+    traffic_groups = {'low': [], 'medium': [], 'high': []}
+    
+    # For zone-specific policy analysis
+    zone_policies = {}
+    sample_states = states[:1000]
+    
+    for zone_idx, zone_name in enumerate(['residential', 'mixed', 'commercial']):
+        zone_policy = agent.get_policy_for_zone(zone_idx, sample_states)
+        zone_policies[zone_name] = zone_policy
+    
+    for i, state in enumerate(sample_states):
+        if i >= len(df):
+            break
+            
+        action = agent.select_action(state)
+        row = df.iloc[i]
+        
+        # Zone type
+        zone_groups[row['zone_type']].append(action)
+        
+        # Time
+        time_key = 'peak' if row['is_peak'] else 'off_peak'
+        time_groups[time_key].append(action)
+        
+        # Traffic
+        if row['vehicle_count'] > 350:
+            traffic_key = 'high'
+        elif row['vehicle_count'] > 200:
+            traffic_key = 'medium'
+        else:
+            traffic_key = 'low'
+        traffic_groups[traffic_key].append(action)
+    
+    # Calculate average toll amount per zone
+    avg_toll_by_zone = {}
+    for zone_name, actions in zone_groups.items():
+        if actions:
+            zone_idx = 0 if zone_name == 'residential' else 1 if zone_name == 'mixed' else 2
+            toll_sum = sum(mdp.get_toll_amount(zone_idx, a) for a in actions)
+            avg_toll_by_zone[zone_name] = toll_sum / len(actions)
+        else:
+            avg_toll_by_zone[zone_name] = 0
+    
+    return {
+        'zone_activation': {zone: np.mean(actions) if actions else 0 
+                          for zone, actions in zone_groups.items()},
+        'zone_toll_levels': zone_policies,
+        'avg_toll_amount': avg_toll_by_zone,
+        'time_activation': {time: np.mean(actions) if actions else 0
+                          for time, actions in time_groups.items()},
+        'traffic_activation': {traffic: np.mean(actions) if actions else 0
+                             for traffic, actions in traffic_groups.items()}
+    }
+
+# ============================================================================
+# RUN EXPERIMENTS
+# ============================================================================
+
+def run_experiment(df: pd.DataFrame, algorithm: str = 'qlearning', 
+                  episodes: int = 100) -> Dict:
+    """Run RL experiment with either Q-learning or SARSA"""
+    print(f"\n{'='*70}")
+    print(f"RUNNING: {algorithm.upper()} (with zone-specific toll levels)")
+    print('='*70)
+    
+    states = prepare_states_from_data(df)
+    hte_params = HTEParams()
+    mdp = MDP(hte_params)
+    
+    # Initialize algorithm
+    if algorithm.lower() == 'qlearning':
+        agent = QLearning(mdp, alpha=0.1, epsilon=0.1)
+    else:  # sarsa
+        agent = SARSA(mdp, alpha=0.1, epsilon=0.1)
+    
+    # Training
+    episode_rewards = []
+    q_history = []
+    
+    for episode in range(episodes):
+        total_reward = 0
+        states_perm = np.random.permutation(states[:1000])
+        
+        for i in range(len(states_perm) - 1):
+            state = states_perm[i]
+            next_state = states_perm[i + 1]
+            
+            action = agent.select_action(state)
+            reward = mdp.reward_function(state, action)
+            total_reward += reward
+            
+            if algorithm.lower() == 'qlearning':
+                agent.update(state, action, reward, next_state)
+            else:  # sarsa
+                next_action = agent.select_action(next_state)
+                agent.update_with_next_action(state, action, reward, next_state, next_action)
+        
+        episode_rewards.append(total_reward)
+        
+        if episode % 10 == 0:
+            q_history.append(agent.q_table.copy())
+        
+        if (episode + 1) % 20 == 0:
+            print(f"Episode {episode + 1}/{episodes}, Reward: {total_reward:.2f}")
+    
+    # Evaluate policy
+    total_reward = 0
+    actions_taken = []
+    toll_amounts = []
+    
+    for i in range(len(states[:2000]) - 1):
+        state = states[i]
+        action = agent.select_action(state)
+        reward = mdp.reward_function(state, action)
+        total_reward += reward
+        actions_taken.append(action)
+        
+        # Record toll amount
+        zone_type = state.get_zone_type()
+        toll_amount = mdp.get_toll_amount(zone_type, action)
+        toll_amounts.append(toll_amount)
+    
+    avg_reward = total_reward / len(actions_taken) if actions_taken else 0
+    avg_toll = np.mean(toll_amounts) if toll_amounts else 0
+    
+    # Policy analysis
+    policy_analysis = analyze_policy_by_features(agent, states[:2000], df, mdp)
+    
+    return {
+        'algorithm': algorithm,
+        'episode_rewards': episode_rewards,
+        'final_evaluation': {
+            'total_reward': total_reward,
+            'avg_reward': avg_reward,
+            'toll_activation_rate': np.mean([1 if a > 0 else 0 for a in actions_taken]),
+            'avg_toll_amount': avg_toll,
+            'action_distribution': {
+                'no_toll': np.mean([1 if a == 0 else 0 for a in actions_taken]),
+                'low_toll': np.mean([1 if a == 1 else 0 for a in actions_taken]),
+                'medium_toll': np.mean([1 if a == 2 else 0 for a in actions_taken]),
+                'high_toll': np.mean([1 if a == 3 else 0 for a in actions_taken])
+            }
+        },
+        'policy_analysis': policy_analysis,
+        'q_table_size': len(agent.q_table),
+        'agent': agent,
+        'mdp': mdp
+    }
+
+# ============================================================================
+# ENHANCED PLOTTING FUNCTION
+# ============================================================================
+
+def plot_comparison_results(qlearning_results, sarsa_results, df):
+    """Create comprehensive comparison plots for both algorithms with toll levels"""
+    
+    fig = plt.figure(figsize=(22, 16))
+    
+    # 1. Learning curves comparison
+    ax1 = plt.subplot(4, 4, 1)
+    episodes = range(len(qlearning_results['episode_rewards']))
+    ax1.plot(episodes, qlearning_results['episode_rewards'], 
+             label='Q-learning', linewidth=2, color='blue')
+    ax1.plot(episodes, sarsa_results['episode_rewards'], 
+             label='SARSA', linewidth=2, color='orange')
+    ax1.set_xlabel('Episode')
+    ax1.set_ylabel('Total Reward')
+    ax1.set_title('A. Learning Curves Comparison')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. Zone-specific toll policies (Q-learning)
+    ax2 = plt.subplot(4, 4, 2)
+    zones = ['Residential', 'Mixed', 'Commercial']
+    zone_names = ['residential', 'mixed', 'commercial']
+    
+    ql_zone_policies = qlearning_results['policy_analysis']['zone_toll_levels']
+    
+    x = np.arange(len(zones))
+    width = 0.2
+    
+    # Extract action probabilities for each toll level
+    toll_levels = ['No Toll', 'Low', 'Medium', 'High']
+    
+    for i, toll_level in enumerate(range(4)):
+        probs = [ql_zone_policies[zone].get(toll_level, 0) for zone in zone_names]
+        ax2.bar(x + (i-1.5)*width, probs, width, label=toll_levels[toll_level], alpha=0.7)
+    
+    ax2.set_ylabel('Probability')
+    ax2.set_title('B. Q-learning: Zone Toll Policies')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(zones)
+    ax2.legend(title='Toll Level')
+    ax2.set_ylim(0, 1)
+    
+    # 3. Zone-specific toll policies (SARSA)
+    ax3 = plt.subplot(4, 4, 3)
+    sarsa_zone_policies = sarsa_results['policy_analysis']['zone_toll_levels']
+    
+    for i, toll_level in enumerate(range(4)):
+        probs = [sarsa_zone_policies[zone].get(toll_level, 0) for zone in zone_names]
+        ax3.bar(x + (i-1.5)*width, probs, width, label=toll_levels[toll_level], alpha=0.7)
+    
+    ax3.set_ylabel('Probability')
+    ax3.set_title('C. SARSA: Zone Toll Policies')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(zones)
+    ax3.legend(title='Toll Level')
+    ax3.set_ylim(0, 1)
+    
+    # 4. Average toll amount by zone
+    ax4 = plt.subplot(4, 4, 4)
+    ql_avg_tolls = [qlearning_results['policy_analysis']['avg_toll_amount'][z] for z in zone_names]
+    sarsa_avg_tolls = [sarsa_results['policy_analysis']['avg_toll_amount'][z] for z in zone_names]
+    
+    x = np.arange(len(zones))
+    bars1 = ax4.bar(x - width/2, ql_avg_tolls, width, label='Q-learning', 
+                    color='blue', alpha=0.7)
+    bars2 = ax4.bar(x + width/2, sarsa_avg_tolls, width, label='SARSA', 
+                    color='orange', alpha=0.7)
+    
+    ax4.set_ylabel('Average Toll Amount ($)')
+    ax4.set_title('D. Average Toll by Zone')
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(zones)
+    ax4.legend()
+    
+    # Add value labels
+    for i, (ql_toll, sarsa_toll) in enumerate(zip(ql_avg_tolls, sarsa_avg_tolls)):
+        ax4.text(i - width/2, ql_toll + 0.1, f'${ql_toll:.2f}', 
+                ha='center', va='bottom', fontsize=9)
+        ax4.text(i + width/2, sarsa_toll + 0.1, f'${sarsa_toll:.2f}', 
+                ha='center', va='bottom', fontsize=9)
+    
+    # 5. Traffic activation comparison
+    ax5 = plt.subplot(4, 4, 5)
+    traffic_levels = ['Low', 'Medium', 'High']
+    
+    ql_action_dist = qlearning_results['final_evaluation']['action_distribution']
+    sarsa_action_dist = sarsa_results['final_evaluation']['action_distribution']
+    
+    # Calculate toll activation rate by traffic (simplified)
+    traffic_data = []
+    for level in ['low', 'medium', 'high']:
+        ql_act = qlearning_results['policy_analysis']['traffic_activation'][level]
+        sarsa_act = sarsa_results['policy_analysis']['traffic_activation'][level]
+        traffic_data.append((ql_act, sarsa_act))
+    
+    ql_rates, sarsa_rates = zip(*traffic_data)
+    
+    x = np.arange(len(traffic_levels))
+    bars1 = ax5.bar(x - width/2, ql_rates, width, label='Q-learning', color='blue', alpha=0.7)
+    bars2 = ax5.bar(x + width/2, sarsa_rates, width, label='SARSA', color='orange', alpha=0.7)
+    
+    ax5.set_ylabel('Toll Activation Rate')
+    ax5.set_title('E. Traffic Volume Activation')
+    ax5.set_xticks(x)
+    ax5.set_xticklabels(traffic_levels)
+    ax5.legend()
+    ax5.set_ylim(0, 1)
+    
+    # 6. Time activation comparison
+    ax6 = plt.subplot(4, 4, 6)
+    times = ['Off-Peak', 'Peak']
+    
+    ql_time_rates = [qlearning_results['policy_analysis']['time_activation'][z] 
+                     for z in ['off_peak', 'peak']]
+    sarsa_time_rates = [sarsa_results['policy_analysis']['time_activation'][z] 
+                        for z in ['off_peak', 'peak']]
+    
+    x = np.arange(len(times))
+    bars1 = ax6.bar(x - width/2, ql_time_rates, width, label='Q-learning', color='blue', alpha=0.7)
+    bars2 = ax6.bar(x + width/2, sarsa_time_rates, width, label='SARSA', color='orange', alpha=0.7)
+    
+    ax6.set_ylabel('Toll Activation Rate')
+    ax6.set_title('F. Time Period Activation')
+    ax6.set_xticks(x)
+    ax6.set_xticklabels(times)
+    ax6.legend()
+    ax6.set_ylim(0, 1)
+    
+    # 7. Action distribution comparison
+    ax7 = plt.subplot(4, 4, 7)
+    action_types = ['No Toll', 'Low', 'Medium', 'High']
+    
+    ql_actions = [ql_action_dist[t] for t in ['no_toll', 'low_toll', 'medium_toll', 'high_toll']]
+    sarsa_actions = [sarsa_action_dist[t] for t in ['no_toll', 'low_toll', 'medium_toll', 'high_toll']]
+    
+    x = np.arange(len(action_types))
+    bars1 = ax7.bar(x - width/2, ql_actions, width, label='Q-learning', color='blue', alpha=0.7)
+    bars2 = ax7.bar(x + width/2, sarsa_actions, width, label='SARSA', color='orange', alpha=0.7)
+    
+    ax7.set_ylabel('Probability')
+    ax7.set_title('G. Overall Action Distribution')
+    ax7.set_xticks(x)
+    ax7.set_xticklabels(action_types, rotation=45, ha='right')
+    ax7.legend()
+    ax7.set_ylim(0, 1)
+    
+    # 8. Q-value distribution comparison
+    ax8 = plt.subplot(4, 4, 8)
+    if hasattr(qlearning_results['agent'], 'q_table') and hasattr(sarsa_results['agent'], 'q_table'):
+        ql_q_values = list(qlearning_results['agent'].q_table.values())
+        sarsa_q_values = list(sarsa_results['agent'].q_table.values())
+        
+        if ql_q_values and sarsa_q_values:
+            ax8.hist(ql_q_values, bins=30, alpha=0.5, label='Q-learning', 
+                    color='blue', density=True, edgecolor='black')
+            ax8.hist(sarsa_q_values, bins=30, alpha=0.5, label='SARSA', 
+                    color='orange', density=True, edgecolor='black')
+            ax8.set_xlabel('Q-value')
+            ax8.set_ylabel('Density')
+            ax8.set_title('H. Q-value Distribution')
+            ax8.legend()
+    
+    # 9. Performance metrics comparison
+    ax9 = plt.subplot(4, 4, 9)
+    metrics = ['Avg Reward', 'Avg Toll', 'Activation Rate', 'Q-table Size']
+    ql_metrics = [
+        qlearning_results['final_evaluation']['avg_reward'],
+        qlearning_results['final_evaluation']['avg_toll_amount'],
+        qlearning_results['final_evaluation']['toll_activation_rate'],
+        qlearning_results['q_table_size'] / 1000
+    ]
+    sarsa_metrics = [
+        sarsa_results['final_evaluation']['avg_reward'],
+        sarsa_results['final_evaluation']['avg_toll_amount'],
+        sarsa_results['final_evaluation']['toll_activation_rate'],
+        sarsa_results['q_table_size'] / 1000
+    ]
+    
+    x = np.arange(len(metrics))
+    bars1 = ax9.bar(x - width/2, ql_metrics, width, label='Q-learning', color='blue', alpha=0.7)
+    bars2 = ax9.bar(x + width/2, sarsa_metrics, width, label='SARSA', color='orange', alpha=0.7)
+    
+    ax9.set_ylabel('Value')
+    ax9.set_title('I. Performance Metrics')
+    ax9.set_xticks(x)
+    ax9.set_xticklabels(metrics, rotation=45, ha='right')
+    ax9.legend()
+    
+    # Add value labels
+    for i, (ql_val, sarsa_val) in enumerate(zip(ql_metrics, sarsa_metrics)):
+        format_str = f'{ql_val:.3f}' if i != 3 else f'{ql_val:.1f}K'
+        ax9.text(i - width/2, ql_val + 0.01, format_str, 
+                ha='center', va='bottom', fontsize=8)
+        format_str = f'{sarsa_val:.3f}' if i != 3 else f'{sarsa_val:.1f}K'
+        ax9.text(i + width/2, sarsa_val + 0.01, format_str, 
+                ha='center', va='bottom', fontsize=8)
+    
+    # 10. Convergence analysis
+    ax10 = plt.subplot(4, 4, 10)
+    ql_smooth = pd.Series(qlearning_results['episode_rewards']).rolling(window=5, center=True).mean()
+    sarsa_smooth = pd.Series(sarsa_results['episode_rewards']).rolling(window=5, center=True).mean()
+    
+    ax10.plot(episodes, ql_smooth, label='Q-learning (smoothed)', linewidth=2, color='blue', alpha=0.7)
+    ax10.plot(episodes, sarsa_smooth, label='SARSA (smoothed)', linewidth=2, color='orange', alpha=0.7)
+    ax10.set_xlabel('Episode')
+    ax10.set_ylabel('Smoothed Reward')
+    ax10.set_title('J. Convergence Analysis (Smoothed)')
+    ax10.legend()
+    ax10.grid(True, alpha=0.3)
+    
+    # 11. Policy agreement by zone
+    ax11 = plt.subplot(4, 4, 11)
+    
+    # Sample decisions for comparison
+    sample_df = df.sample(500, random_state=42)
+    sample_states = prepare_states_from_data(sample_df)
+    
+    # Calculate agreement by zone
+    zone_agreements = {'residential': [], 'mixed': [], 'commercial': []}
+    
+    for i, state in enumerate(sample_states):
+        ql_action = qlearning_results['agent'].select_action(state)
+        sarsa_action = sarsa_results['agent'].select_action(state)
+        
+        if state.get_zone_type() == 0:
+            zone_agreements['residential'].append(1 if ql_action == sarsa_action else 0)
+        elif state.get_zone_type() == 1:
+            zone_agreements['mixed'].append(1 if ql_action == sarsa_action else 0)
+        else:
+            zone_agreements['commercial'].append(1 if ql_action == sarsa_action else 0)
+    
+    agreement_rates = {zone: np.mean(agreements) if agreements else 0 
+                      for zone, agreements in zone_agreements.items()}
+    
+    zones = list(agreement_rates.keys())
+    rates = list(agreement_rates.values())
+    
+    colors = plt.cm.RdYlGn(rates)
+    bars = ax11.bar(zones, rates, color=colors)
+    ax11.set_ylabel('Agreement Rate')
+    ax11.set_title('K. Policy Agreement by Zone')
+    ax11.set_ylim(0, 1)
+    
+    for bar, rate in zip(bars, rates):
+        ax11.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02, 
+                f'{rate:.1%}', ha='center', va='bottom', fontsize=9)
+    
+    # 12. Toll amount vs HTE effect
+    ax12 = plt.subplot(4, 4, 12)
+    
+    # Show how toll amounts relate to zone HTE
+    zone_hte = [-0.5996, -0.8471, -1.2557]  # residential, mixed, commercial
+    toll_schedules = qlearning_results['mdp'].toll_levels
+    
+    for zone_idx, zone_name in enumerate(['Residential', 'Mixed', 'Commercial']):
+        tolls = toll_schedules[zone_idx]
+        ax12.plot(tolls, [abs(h) * (1 + 0.3 * i/3) for i, h in enumerate([zone_hte[zone_idx]] * 4)], 
+                 marker='o', label=zone_name, linewidth=2)
+    
+    ax12.set_xlabel('Toll Amount ($)')
+    ax12.set_ylabel('Expected Delay Reduction (min)')
+    ax12.set_title('L. Toll Amount vs Expected Effect')
+    ax12.legend()
+    ax12.grid(True, alpha=0.3)
+    
+    # 13-16. Detailed analysis
+    for i in range(13, 17):
+        ax = plt.subplot(4, 4, i)
+        ax.axis('off')
+    
+    # Summary statistics
+    ax13 = plt.subplot(4, 4, 13)
+    ax13.axis('off')
+    
+    ql_reward = qlearning_results['final_evaluation']['avg_reward']
+    sarsa_reward = sarsa_results['final_evaluation']['avg_reward']
+    improvement = (sarsa_reward - ql_reward) / ql_reward * 100 if ql_reward != 0 else 0
+    
+    # Determine which algorithm is better
+    algorithm_name = "SARSA" if sarsa_reward > ql_reward else "Q-learning"
+    
+    # Get detailed zone policies
+    residential_ql = ql_zone_policies['residential']
+    mixed_ql = ql_zone_policies['mixed']
+    commercial_ql = ql_zone_policies['commercial']
+    
+    residential_sarsa = sarsa_zone_policies['residential']
+    mixed_sarsa = sarsa_zone_policies['mixed']
+    commercial_sarsa = sarsa_zone_policies['commercial']
+    
+    summary_text = (
+        f"ZONE-SPECIFIC TOLL OPTIMIZATION\n\n"
+        f"Q-learning Performance:\n"
+        f"• Residential: {residential_ql.get(3, 0):.1%} high toll\n"
+        f"• Mixed: {mixed_ql.get(3, 0):.1%} high toll\n"
+        f"• Commercial: {commercial_ql.get(3, 0):.1%} high toll\n\n"
+        
+        f"SARSA Performance:\n"
+        f"• Residential: {residential_sarsa.get(3, 0):.1%} high toll\n"
+        f"• Mixed: {mixed_sarsa.get(3, 0):.1%} high toll\n"
+        f"• Commercial: {commercial_sarsa.get(3, 0):.1%} high toll\n\n"
+        
+        f"Comparison:\n"
+        f"• {algorithm_name} achieves higher reward\n"
+        f"• Reward difference: {improvement:+.1f}%\n"
+        f"• Overall agreement: {np.mean(list(agreement_rates.values())):.1%}"
+    )
+    
+    ax13.text(0.1, 0.5, summary_text, fontsize=9, 
+             verticalalignment='center', fontfamily='monospace')
+    
+    plt.suptitle('Comprehensive RL Comparison: Zone-Specific Toll Optimization with Multiple Toll Levels', 
+                fontsize=16, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.show()
+    
+    return {
+        'agreement_rate': np.mean(list(agreement_rates.values())),
+        'improvement_percentage': improvement,
+        'ql_reward': ql_reward,
+        'sarsa_reward': sarsa_reward,
+        'better_algorithm': algorithm_name,
+        'zone_agreements': agreement_rates
+    }
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def main():
+    """Main execution function"""
+    print("="*80)
+    print("REINFORCEMENT LEARNING WITH HETEROGENEOUS TREATMENT EFFECTS")
+    print("Q-LEARNING vs SARSA COMPARISON WITH ZONE-SPECIFIC TOLL LEVELS")
+    print("="*80)
+    
+    # Create synthetic data
+    np.random.seed(42)
+    n_samples = 5000
+    dummy_data = {
+        'vehicle_count': np.random.randint(50, 500, n_samples),
+        'road_quality': np.random.uniform(0.5, 2.0, n_samples),
+        'hour': np.random.randint(0, 24, n_samples),
+        'is_peak': np.random.binomial(1, 0.3, n_samples),
+        'is_weekend': np.random.binomial(1, 0.2, n_samples),
+        'rain': np.random.binomial(1, 0.1, n_samples),
+        'event': np.random.binomial(1, 0.05, n_samples),
+        'zone_type': np.random.choice(['residential', 'mixed', 'commercial'], 
+                                     n_samples, p=[0.4, 0.3, 0.3])
+    }
+    df = pd.DataFrame(dummy_data)
+    
+    # Run Q-learning
+    print("\n" + "="*70)
+    print("TRAINING Q-LEARNING (Zone-specific toll levels)")
+    print("="*70)
+    qlearning_results = run_experiment(df, algorithm='qlearning', episodes=100)
+    
+    # Run SARSA
+    print("\n" + "="*70)
+    print("TRAINING SARSA (Zone-specific toll levels)")
+    print("="*70)
+    sarsa_results = run_experiment(df, algorithm='sarsa', episodes=100)
+    
+    # Compare results
+    print("\n" + "="*70)
+    print("COMPARISON RESULTS")
+    print("="*70)
+    
+    comparison_data = []
+    for results in [qlearning_results, sarsa_results]:
+        eval_stats = results['final_evaluation']
+        comparison_data.append({
+            'Algorithm': results['algorithm'].upper(),
+            'Avg Reward': f"{eval_stats['avg_reward']:.3f}",
+            'Avg Toll ($)': f"{eval_stats['avg_toll_amount']:.2f}",
+            'Toll Rate': f"{eval_stats['toll_activation_rate']:.2%}",
+            'High Toll Rate': f"{eval_stats['action_distribution']['high_toll']:.2%}",
+            'Q-table Size': f"{results['q_table_size']:,}"
+        })
+    
+    comparison_df = pd.DataFrame(comparison_data)
+    print(comparison_df.to_string(index=False))
+    
+    # Statistical test
+    print("\nSTATISTICAL SIGNIFICANCE TEST:")
+    ql_rewards = qlearning_results['episode_rewards'][-20:]  # Last 20 episodes
+    sarsa_rewards = sarsa_results['episode_rewards'][-20:]
+    
+    t_stat, p_value = stats.ttest_ind(ql_rewards, sarsa_rewards)
+    print(f"Independent t-test: t = {t_stat:.3f}, p = {p_value:.4f}")
+    print(f"Significant difference: {'YES' if p_value < 0.05 else 'NO'}")
+    
+    # Create comprehensive plots
+    print("\n" + "="*70)
+    print("GENERATING COMPREHENSIVE PLOTS")
+    print("="*70)
+    
+    plot_results = plot_comparison_results(qlearning_results, sarsa_results, df)
+    
+    # Get detailed analysis
+    ql_zone_policies = qlearning_results['policy_analysis']['zone_toll_levels']
+    sarsa_zone_policies = sarsa_results['policy_analysis']['zone_toll_levels']
+    
+    ql_avg_tolls = qlearning_results['policy_analysis']['avg_toll_amount']
+    sarsa_avg_tolls = sarsa_results['policy_analysis']['avg_toll_amount']
+    
+    return {
+        'qlearning': qlearning_results,
+        'sarsa': sarsa_results,
+        'comparison': comparison_df,
+        'plot_results': plot_results,
+        'p_value': p_value,
+        't_statistic': t_stat
+    }
+
+# Execute
+if __name__ == "__main__":
+    results = main()
+
+C. ABLATION ANALYSIS (MULTI-LEVEL TOLL ACTIVATION)
+---------------------------------------------------
+class AblationStudyMultiLevel:
+    """Ablation study for multi-level toll policies comparing Q-learning vs SARSA"""
+    
+    def __init__(self, df, base_hte_params):
+        self.df = df
+        self.base_hte = base_hte_params
+        self.results = {'qlearning': {}, 'sarsa': {}}
+        self.zone_names = ['residential', 'mixed', 'commercial']
+    
+    def create_ablated_scenarios(self):
+        """Create ablation scenarios for multi-level toll policies"""
+        scenarios = {
+            'full': self.base_hte,  # All HTE components
+            
+            # Individual component ablations
+            'no_zone_effects': self._modify_zone_effects(self.base_hte),
+            'no_traffic_effects': self._modify_traffic_effects(self.base_hte),
+            'no_road_effects': self._modify_road_effects(self.base_hte),
+            'no_time_effects': self._modify_time_effects(self.base_hte),
+            'no_condition_effects': self._modify_condition_effects(self.base_hte),
+            
+            # Extreme ablation
+            'flat_hte': self._create_flat_hte()
+        }
+        return scenarios
+    
+    def _create_flat_hte(self):
+        """Create completely flat HTE (no heterogeneity)"""
+        flat = HTEParams()
+        avg_effect = -0.8  # Average of all effects
+        
+        # Set all to average
+        for attr in dir(flat):
+            if not attr.startswith('_'):
+                setattr(flat, attr, avg_effect)
+        
+        return flat
+    
+    def _modify_zone_effects(self, hte_params):
+        """Remove zone heterogeneity - make all zones equal"""
+        modified = HTEParams()
+        # Copy all values
+        for attr in dir(hte_params):
+            if not attr.startswith('_'):
+                setattr(modified, attr, getattr(hte_params, attr))
+        
+        # Make zone effects equal (average)
+        avg_zone = (hte_params.residential + hte_params.mixed + hte_params.commercial) / 3
+        modified.residential = avg_zone
+        modified.mixed = avg_zone
+        modified.commercial = avg_zone
+        
+        return modified
+    
+    def _modify_traffic_effects(self, hte_params):
+        """Remove traffic heterogeneity"""
+        modified = HTEParams()
+        for attr in dir(hte_params):
+            if not attr.startswith('_'):
+                setattr(modified, attr, getattr(hte_params, attr))
+        
+        # Make traffic effects equal
+        avg_traffic = (hte_params.traffic_low + hte_params.traffic_medium + hte_params.traffic_high) / 3
+        modified.traffic_low = avg_traffic
+        modified.traffic_medium = avg_traffic
+        modified.traffic_high = avg_traffic
+        
+        return modified
+    
+    def _modify_road_effects(self, hte_params):
+        """Remove road quality heterogeneity"""
+        modified = HTEParams()
+        for attr in dir(hte_params):
+            if not attr.startswith('_'):
+                setattr(modified, attr, getattr(hte_params, attr))
+        
+        # Make road effects equal
+        avg_road = (hte_params.road_q1 + hte_params.road_q2 + hte_params.road_q3 + hte_params.road_q4) / 4
+        modified.road_q1 = avg_road
+        modified.road_q2 = avg_road
+        modified.road_q3 = avg_road
+        modified.road_q4 = avg_road
+        
+        return modified
+    
+    def _modify_time_effects(self, hte_params):
+        """Remove time heterogeneity"""
+        modified = HTEParams()
+        for attr in dir(hte_params):
+            if not attr.startswith('_'):
+                setattr(modified, attr, getattr(hte_params, attr))
+        
+        # Make time effects equal
+        avg_time = (hte_params.off_peak + hte_params.peak) / 2
+        modified.off_peak = avg_time
+        modified.peak = avg_time
+        
+        avg_day = (hte_params.weekday + hte_params.weekend) / 2
+        modified.weekday = avg_day
+        modified.weekend = avg_day
+        
+        return modified
+    
+    def _modify_condition_effects(self, hte_params):
+        """Remove condition heterogeneity"""
+        modified = HTEParams()
+        for attr in dir(hte_params):
+            if not attr.startswith('_'):
+                setattr(modified, attr, getattr(hte_params, attr))
+        
+        # Make condition effects equal
+        avg_weather = (hte_params.no_rain + hte_params.rain) / 2
+        modified.no_rain = avg_weather
+        modified.rain = avg_weather
+        
+        avg_event = (hte_params.no_event + hte_params.event) / 2
+        modified.no_event = avg_event
+        modified.event = avg_event
+        
+        return modified
+    
+    def run_single_ablation(self, df_sample, hte_params, algorithm='qlearning', episodes=20):
+        """Run a single ablation scenario with specified algorithm"""
+        states = prepare_states_from_data(df_sample)
+        
+        # Create MDP with multi-level toll policies
+        mdp = MDP(hte_params)
+        
+        # Create agent
+        if algorithm == 'qlearning':
+            agent = QLearning(mdp, alpha=0.1, epsilon=0.1)
+        else:  # sarsa
+            agent = SARSA(mdp, alpha=0.1, epsilon=0.1)
+        
+        # Train
+        episode_rewards = []
+        for episode in range(episodes):
+            total_reward = 0
+            states_perm = np.random.permutation(states[:300])
+            
+            for i in range(len(states_perm) - 1):
+                state = states_perm[i]
+                next_state = states_perm[i + 1]
+                
+                action = agent.select_action(state)
+                reward = mdp.reward_function(state, action)
+                total_reward += reward
+                
+                if algorithm == 'qlearning':
+                    agent.update(state, action, reward, next_state)
+                else:
+                    next_action = agent.select_action(next_state)
+                    agent.update_with_next_action(state, action, reward, next_state, next_action)
+            
+            episode_rewards.append(total_reward)
+        
+        # Evaluate
+        test_states = states[300:400]
+        total_reward = 0
+        actions_taken = []
+        toll_amounts = []
+        zone_tolls = {0: [], 1: [], 2: []}
+        
+        for state in test_states:
+            action = agent.select_action(state)
+            reward = mdp.reward_function(state, action)
+            total_reward += reward
+            actions_taken.append(action)
+            
+            # Record toll amount
+            zone_type = state.get_zone_type()
+            toll_amount = mdp.get_toll_amount(zone_type, action)
+            toll_amounts.append(toll_amount)
+            zone_tolls[zone_type].append(toll_amount)
+        
+        avg_reward = total_reward / len(test_states)
+        avg_toll = np.mean(toll_amounts)
+        
+        # Zone-specific analysis
+        zone_analysis = {}
+        for zone_idx, zone_name in enumerate(self.zone_names):
+            if zone_tolls[zone_idx]:
+                zone_analysis[zone_name] = {
+                    'avg_toll': np.mean(zone_tolls[zone_idx]),
+                    'activation_rate': np.mean([1 if a > 0 else 0 for a in 
+                                               [actions_taken[i] for i, s in enumerate(test_states) 
+                                                if s.get_zone_type() == zone_idx]]),
+                    'high_toll_rate': np.mean([1 if a == 3 else 0 for a in 
+                                              [actions_taken[i] for i, s in enumerate(test_states) 
+                                               if s.get_zone_type() == zone_idx]])
+                }
+        
+        return {
+            'episode_rewards': episode_rewards,
+            'final_evaluation': {
+                'avg_reward': avg_reward,
+                'avg_toll_amount': avg_toll,
+                'toll_activation_rate': np.mean([1 if a > 0 else 0 for a in actions_taken]),
+                'action_distribution': {
+                    'no_toll': np.mean([1 if a == 0 else 0 for a in actions_taken]),
+                    'low_toll': np.mean([1 if a == 1 else 0 for a in actions_taken]),
+                    'medium_toll': np.mean([1 if a == 2 else 0 for a in actions_taken]),
+                    'high_toll': np.mean([1 if a == 3 else 0 for a in actions_taken])
+                }
+            },
+            'zone_analysis': zone_analysis,
+            'agent': agent
+        }
+    
+    def run_ablation_comparison(self, episodes=30):
+        """Run ablation study comparing Q-learning vs SARSA"""
+        print("\n" + "="*80)
+        print("ABLATION STUDY: Q-LEARNING vs SARSA WITH MULTI-LEVEL TOLL POLICIES")
+        print("="*80)
+        
+        scenarios = self.create_ablated_scenarios()
+        df_sample = self.df[:1000]  # Use subset for speed
+        
+        for scenario_name, hte_params in scenarios.items():
+            print(f"\n{'='*60}")
+            print(f"SCENARIO: {scenario_name.upper().replace('_', ' ')}")
+            print('='*60)
+            
+            # Run Q-learning
+            print(f"\n  Q-learning:")
+            ql_result = self.run_single_ablation(df_sample, hte_params, 'qlearning', episodes)
+            self.results['qlearning'][scenario_name] = ql_result
+            print(f"    Avg Reward: {ql_result['final_evaluation']['avg_reward']:.3f}")
+            print(f"    Avg Toll: ${ql_result['final_evaluation']['avg_toll_amount']:.2f}")
+            print(f"    Activation: {ql_result['final_evaluation']['toll_activation_rate']:.1%}")
+            
+            # Run SARSA
+            print(f"\n  SARSA:")
+            sarsa_result = self.run_single_ablation(df_sample, hte_params, 'sarsa', episodes)
+            self.results['sarsa'][scenario_name] = sarsa_result
+            print(f"    Avg Reward: {sarsa_result['final_evaluation']['avg_reward']:.3f}")
+            print(f"    Avg Toll: ${sarsa_result['final_evaluation']['avg_toll_amount']:.2f}")
+            print(f"    Activation: {sarsa_result['final_evaluation']['toll_activation_rate']:.1%}")
+            
+            # Compare
+            ql_reward = ql_result['final_evaluation']['avg_reward']
+            sarsa_reward = sarsa_result['final_evaluation']['avg_reward']
+            advantage = sarsa_reward - ql_reward
+            advantage_pct = (advantage / ql_reward) * 100 if ql_reward != 0 else 0
+            
+            print(f"\n  Comparison:")
+            print(f"    SARSA advantage: {advantage:.3f} ({advantage_pct:.1f}%)")
+            
+            # Zone toll comparison
+            print(f"    Zone tolls (QL/SARSA):")
+            for zone in self.zone_names:
+                ql_toll = ql_result['zone_analysis'].get(zone, {}).get('avg_toll', 0)
+                sarsa_toll = sarsa_result['zone_analysis'].get(zone, {}).get('avg_toll', 0)
+                print(f"      {zone.capitalize()}: ${ql_toll:.2f} / ${sarsa_toll:.2f}")
+        
+        return self.results
+    
+    def analyze_results(self):
+        """Analyze ablation results"""
+        if not self.results['qlearning']:
+            print("Run ablation study first")
+            return None
+        
+        analysis = []
+        scenarios = list(self.results['qlearning'].keys())
+        
+        for scenario in scenarios:
+            ql = self.results['qlearning'][scenario]
+            sarsa = self.results['sarsa'][scenario]
+            
+            ql_reward = ql['final_evaluation']['avg_reward']
+            sarsa_reward = sarsa['final_evaluation']['avg_reward']
+            
+            # Calculate SARSA advantage
+            advantage = sarsa_reward - ql_reward
+            advantage_pct = (advantage / ql_reward) * 100 if ql_reward != 0 else 0
+            
+            # Calculate zone toll differences
+            zone_diffs = {}
+            for zone in self.zone_names:
+                ql_toll = ql['zone_analysis'].get(zone, {}).get('avg_toll', 0)
+                sarsa_toll = sarsa['zone_analysis'].get(zone, {}).get('avg_toll', 0)
+                zone_diffs[zone] = sarsa_toll - ql_toll
+            
+            analysis.append({
+                'Scenario': scenario.replace('_', ' ').title(),
+                'QL Reward': ql_reward,
+                'SARSA Reward': sarsa_reward,
+                'SARSA Advantage': advantage,
+                'Advantage %': advantage_pct,
+                'Zone Toll Differences': zone_diffs
+            })
+        
+        return pd.DataFrame(analysis)
+    
+    def plot_ablation_comparison(self):
+        """Create visualization of ablation results"""
+        if not self.results['qlearning']:
+            print("Run ablation study first")
+            return
+        
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        scenarios = list(self.results['qlearning'].keys())
+        
+        # 1. Performance comparison across scenarios
+        ax1 = axes[0, 0]
+        ql_rewards = [self.results['qlearning'][s]['final_evaluation']['avg_reward'] for s in scenarios]
+        sarsa_rewards = [self.results['sarsa'][s]['final_evaluation']['avg_reward'] for s in scenarios]
+        
+        x = np.arange(len(scenarios))
+        width = 0.35
+        
+        bars1 = ax1.bar(x - width/2, ql_rewards, width, label='Q-learning', color='blue', alpha=0.7)
+        bars2 = ax1.bar(x + width/2, sarsa_rewards, width, label='SARSA', color='orange', alpha=0.7)
+        
+        ax1.set_ylabel('Average Reward')
+        ax1.set_title('A. Performance Across Ablation Scenarios')
+        ax1.set_xticks(x)
+        ax1.set_xticklabels([s.replace('_', '\n') for s in scenarios], rotation=45, ha='right')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3, axis='y')
+        
+        # Highlight full HTE
+        full_idx = scenarios.index('full')
+        bars1[full_idx].set_edgecolor('green')
+        bars1[full_idx].set_linewidth(2)
+        bars2[full_idx].set_edgecolor('green')
+        bars2[full_idx].set_linewidth(2)
+        
+        # 2. SARSA advantage by scenario (Simplified with clear legend)
+        ax2 = axes[0, 1]
+        advantages = [sarsa_rewards[i] - ql_rewards[i] for i in range(len(scenarios))]
+        
+        # Simple color scheme
+        colors = ['green' if adv > 0 else 'red' if adv < 0 else 'gray' for adv in advantages]
+        bars = ax2.bar(range(len(scenarios)), advantages, color=colors, alpha=0.7)
+        
+        # Create simple legend
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='green', alpha=0.7, label='SARSA Advantage > 0'),
+            Patch(facecolor='red', alpha=0.7, label='SARSA Advantage < 0'),
+            Patch(facecolor='gray', alpha=0.7, label='SARSA Advantage = 0')
+        ]
+        ax2.legend(handles=legend_elements, loc='best')
+        
+        ax2.set_ylabel('SARSA Advantage (Reward)')
+        ax2.set_title('B. SARSA Advantage by Scenario\nGreen: SARSA Better, Red: Q-learning Better')
+        ax2.set_xticks(range(len(scenarios)))
+        ax2.set_xticklabels([s.replace('_', '\n') for s in scenarios], rotation=45, ha='right')
+        ax2.axhline(y=0, color='black', linestyle='-', linewidth=1)
+        ax2.grid(True, alpha=0.3, axis='y', linestyle=':')
+        
+        # Add value labels
+        for i, (bar, adv) in enumerate(zip(bars, advantages)):
+            if abs(adv) > 0.001:  # Label non-zero values
+                height = bar.get_height()
+                va = 'bottom' if height > 0 else 'top'
+                offset = max(advantages) * 0.03 if height > 0 else min(advantages) * 0.03
+                ax2.text(bar.get_x() + bar.get_width()/2., height + offset,
+                        f'{adv:.3f}', ha='center', va=va, fontsize=8,
+                        fontweight='bold' if abs(adv) > 0.1 else 'normal')
+        
+        # 3. Performance drop from full HTE
+        ax3 = axes[0, 2]
+        full_reward = self.results['qlearning']['full']['final_evaluation']['avg_reward']
+        ql_drops = []
+        sarsa_drops = []
+        
+        for scenario in scenarios:
+            if scenario != 'full':
+                ql_drop = (full_reward - self.results['qlearning'][scenario]['final_evaluation']['avg_reward']) / full_reward * 100
+                sarsa_drop = (full_reward - self.results['sarsa'][scenario]['final_evaluation']['avg_reward']) / full_reward * 100
+                ql_drops.append(ql_drop)
+                sarsa_drops.append(sarsa_drop)
+        
+        drop_scenarios = [s for s in scenarios if s != 'full']
+        x_drop = np.arange(len(drop_scenarios))
+        
+        bars1 = ax3.bar(x_drop - width/2, ql_drops, width, label='Q-learning', color='blue', alpha=0.7)
+        bars2 = ax3.bar(x_drop + width/2, sarsa_drops, width, label='SARSA', color='orange', alpha=0.7)
+        
+        ax3.set_ylabel('Performance Drop from Full HTE (%)')
+        ax3.set_title('C. Sensitivity to HTE Component Removal')
+        ax3.set_xticks(x_drop)
+        ax3.set_xticklabels([s.replace('_', '\n') for s in drop_scenarios], rotation=45, ha='right')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3, axis='y')
+        
+        # 4. Zone toll comparison for full HTE
+        ax4 = axes[1, 0]
+        zones = ['Residential', 'Mixed', 'Commercial']
+        
+        ql_full = self.results['qlearning']['full']
+        sarsa_full = self.results['sarsa']['full']
+        
+        ql_tolls = [ql_full['zone_analysis'][z.lower()]['avg_toll'] for z in zones]
+        sarsa_tolls = [sarsa_full['zone_analysis'][z.lower()]['avg_toll'] for z in zones]
+        
+        x_zone = np.arange(len(zones))
+        bars1 = ax4.bar(x_zone - width/2, ql_tolls, width, label='Q-learning', color='blue', alpha=0.7)
+        bars2 = ax4.bar(x_zone + width/2, sarsa_tolls, width, label='SARSA', color='orange', alpha=0.7)
+        
+        ax4.set_ylabel('Average Toll Amount ($)')
+        ax4.set_title('D. Zone Tolls: Full HTE')
+        ax4.set_xticks(x_zone)
+        ax4.set_xticklabels(zones)
+        ax4.legend()
+        ax4.grid(True, alpha=0.3, axis='y')
+        
+        # 5. Action distribution for full HTE
+        ax5 = axes[1, 1]
+        actions = ['No Toll', 'Low', 'Medium', 'High']
+        
+        ql_actions = [
+            ql_full['final_evaluation']['action_distribution']['no_toll'],
+            ql_full['final_evaluation']['action_distribution']['low_toll'],
+            ql_full['final_evaluation']['action_distribution']['medium_toll'],
+            ql_full['final_evaluation']['action_distribution']['high_toll']
+        ]
+        
+        sarsa_actions = [
+            sarsa_full['final_evaluation']['action_distribution']['no_toll'],
+            sarsa_full['final_evaluation']['action_distribution']['low_toll'],
+            sarsa_full['final_evaluation']['action_distribution']['medium_toll'],
+            sarsa_full['final_evaluation']['action_distribution']['high_toll']
+        ]
+        
+        x_action = np.arange(len(actions))
+        bars1 = ax5.bar(x_action - width/2, ql_actions, width, label='Q-learning', color='blue', alpha=0.7)
+        bars2 = ax5.bar(x_action + width/2, sarsa_actions, width, label='SARSA', color='orange', alpha=0.7)
+        
+        ax5.set_ylabel('Probability')
+        ax5.set_title('E. Action Distribution: Full HTE')
+        ax5.set_xticks(x_action)
+        ax5.set_xticklabels(actions)
+        ax5.legend()
+        ax5.set_ylim(0, 1)
+        ax5.grid(True, alpha=0.3, axis='y')
+        
+        # 6. Summary statistics
+        ax6 = axes[1, 2]
+        ax6.axis('off')
+        
+        # Calculate key statistics
+        ql_full_reward = ql_full['final_evaluation']['avg_reward']
+        sarsa_full_reward = sarsa_full['final_evaluation']['avg_reward']
+        overall_advantage = sarsa_full_reward - ql_full_reward
+        advantage_pct = (overall_advantage / ql_full_reward) * 100
+        
+        # Count scenarios where SARSA outperforms
+        sarssa_wins = sum(1 for i in range(len(scenarios)) 
+                         if sarsa_rewards[i] > ql_rewards[i])
+        
+        # Find most impactful ablation
+        performance_drops = []
+        for scenario in drop_scenarios:
+            idx = scenarios.index(scenario)
+            ql_drop = (ql_rewards[full_idx] - ql_rewards[idx]) / ql_rewards[full_idx] * 100
+            performance_drops.append((scenario, ql_drop))
+        
+        performance_drops.sort(key=lambda x: x[1], reverse=True)
+        most_impactful = performance_drops[0][0].replace('_', ' ') if performance_drops else "N/A"
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def run_ablation_analysis_for_paper():
+    """Run complete ablation analysis for paper"""
+    
+    # Create synthetic data
+    print("="*80)
+    print("CREATING DATASET FOR ABLATION STUDY")
+    print("="*80)
+    
+    np.random.seed(42)
+    n_samples = 2000  # Smaller for faster ablation study
+    dummy_data = {
+        'vehicle_count': np.random.randint(50, 500, n_samples),
+        'road_quality': np.random.uniform(0.5, 2.0, n_samples),
+        'hour': np.random.randint(0, 24, n_samples),
+        'is_peak': np.random.binomial(1, 0.3, n_samples),
+        'is_weekend': np.random.binomial(1, 0.2, n_samples),
+        'rain': np.random.binomial(1, 0.1, n_samples),
+        'event': np.random.binomial(1, 0.05, n_samples),
+        'zone_type': np.random.choice(['residential', 'mixed', 'commercial'], 
+                                     n_samples, p=[0.4, 0.3, 0.3])
+    }
+    df = pd.DataFrame(dummy_data)
+    
+    # Create ablation study
+    hte_params = HTEParams()
+    ablation_study = AblationStudyMultiLevel(df, hte_params)
+    
+    # Run ablation comparison
+    ablation_results = ablation_study.run_ablation_comparison(episodes=25)
+    
+    # Analyze results
+    print("\n" + "="*80)
+    print("ANALYZING ABLATION RESULTS")
+    print("="*80)
+    
+    analysis_df = ablation_study.analyze_results()
+    if analysis_df is not None:
+        print("\nAblation Analysis Summary:")
+        print(analysis_df[['Scenario', 'QL Reward', 'SARSA Reward', 'SARSA Advantage', 'Advantage %']].to_string(index=False))
+    
+    # Create visualization
+    print("\n" + "="*80)
+    print("CREATING VISUALIZATION")
+    print("="*80)
+    
+    ablation_study.plot_ablation_comparison()
+    
+    # Final statistical analysis
+    print("\n" + "="*80)
+    print("STATISTICAL ANALYSIS")
+    print("="*80)
+    
+    # Compare full HTE performance
+    ql_full_rewards = ablation_results['qlearning']['full']['episode_rewards'][-10:]
+    sarsa_full_rewards = ablation_results['sarsa']['full']['episode_rewards'][-10:]
+    
+    t_stat, p_value = stats.ttest_ind(ql_full_rewards, sarsa_full_rewards)
+    
+    print(f"\nFull HTE Comparison:")
+    print(f"  Q-learning final reward: {np.mean(ql_full_rewards):.3f}")
+    print(f"  SARSA final reward: {np.mean(sarsa_full_rewards):.3f}")
+    print(f"  t-statistic: {t_stat:.3f}")
+    print(f"  p-value: {p_value:.4f}")
+    print(f"  Significant difference: {'YES' if p_value < 0.05 else 'NO'}")
+    
+    return {
+        'ablation_study': ablation_study,
+        'ablation_results': ablation_results,
+        'analysis_df': analysis_df,
+        'statistical_test': {
+            't_statistic': t_stat,
+            'p_value': p_value,
+            'significant': p_value < 0.05
+        }
+    }
+
+# Execute
+if __name__ == "__main__":
+    print("="*80)
+    print("RUNNING ABLATION STUDY FOR MULTI-LEVEL TOLL POLICIES")
+    print("="*80)
+    
+    results = run_ablation_analysis_for_paper()
+   
+    
+   
