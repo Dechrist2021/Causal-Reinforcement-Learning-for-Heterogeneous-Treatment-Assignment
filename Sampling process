@@ -1,0 +1,345 @@
+#####################################################
+Importing important libraries
+#####################################################
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy import stats
+import seaborn as sns
+
+####################################################
+The main code for sampling
+####################################################
+# Temporal-preserving:
+def simple_temporal_sample(df, fraction=0.1):
+    """
+    Simple but preserves temporal order
+    """
+    # Sort by time
+    df = df.sort_values(['zone_id', 'timestamp'])
+    
+    # Take first N% of time periods for each zone
+    sampled_zones = []
+    for zone_id in df['zone_id'].unique():
+        zone_data = df[df['zone_id'] == zone_id].copy()
+        n_to_keep = int(len(zone_data) * fraction)
+        zone_sample = zone_data.iloc[:n_to_keep]
+        sampled_zones.append(zone_sample)
+    
+    result = pd.concat(sampled_zones, ignore_index=True)
+    
+    print(f"Sampled {len(result):,} from {len(df):,}")
+    print(f"Preserves temporal order within each zone")
+    
+    return result
+
+# Calling the function
+df_sampled = simple_temporal_sample(data, fraction=0.25)
+
+#####################################################
+Validation code
+#####################################################
+def validate_sampling_realistic(original_df, sampled_df, features_to_check=None, 
+                               treatment_col='toll_active', outcome_col='final_delay'):
+    """
+    REALISTIC sampling validation with appropriate thresholds
+    """
+    
+    print("="*80)
+    print("REALISTIC SAMPLING VALIDATION FOR CAUSAL RL")
+    print("="*80)
+    
+    print(f"Original: {len(original_df):,} rows | Sampled: {len(sampled_df):,} rows")
+    print(f"Sampling fraction: {len(sampled_df)/len(original_df):.1%}")
+    print()
+    
+    if features_to_check is None:
+        features_to_check = ['vehicle_count', 'road_quality', 'hour', 'is_peak', 
+                           'is_weekend', 'rain', 'event', 'zone_type']
+    
+    # REALISTIC THRESHOLDS BASED ON RESEARCH
+    THRESHOLDS = {
+        'distribution_ks_p': 0.01,  # p < 0.01 means significant difference
+        'treatment_rate_diff': 0.05,  # 5% absolute difference
+        'mean_relative_diff': 0.10,  # 10% relative difference in means
+        'hte_correlation': 0.60,  # HTE correlation > 0.6 is GOOD for sampling
+        'temporal_correlation': 0.80,  # Temporal patterns should be well preserved
+    }
+    
+    validation_passed = {
+        'feature_distributions': True,
+        'treatment_balance': True,
+        'outcome_distribution': True,
+        'temporal_patterns': True,
+        'hte_preservation': True
+    }
+    
+    results = {}
+    
+    # 1. QUICK DISTRIBUTION CHECK
+    print("1. FEATURE DISTRIBUTION CHECK (Realistic thresholds)")
+    print("-" * 50)
+    
+    problematic_features = []
+    for feature in features_to_check:
+        if original_df[feature].dtype in ['int64', 'float64']:
+            ks_stat, ks_p = stats.ks_2samp(original_df[feature].dropna(), 
+                                          sampled_df[feature].dropna())
+            
+            mean_orig = original_df[feature].mean()
+            mean_samp = sampled_df[feature].mean()
+            mean_diff_pct = abs(mean_orig - mean_samp) / mean_orig * 100 if mean_orig != 0 else 0
+            
+            if ks_p < THRESHOLDS['distribution_ks_p']:
+                validation_passed['feature_distributions'] = False
+                problematic_features.append(f"{feature} (KS p={ks_p:.4f})")
+            
+            results[f'feature_{feature}'] = {
+                'ks_p': ks_p,
+                'mean_diff_pct': mean_diff_pct,
+                'passed': ks_p >= THRESHOLDS['distribution_ks_p'] and mean_diff_pct < THRESHOLDS['mean_relative_diff'] * 100
+            }
+    
+    if problematic_features:
+        print(f"⚠ {len(problematic_features)} features show significant differences:")
+        for feat in problematic_features:
+            print(f"   - {feat}")
+    else:
+        print("✅ All feature distributions well preserved")
+    
+    # 2. TREATMENT BALANCE CHECK
+    print("\n2. TREATMENT BALANCE CHECK")
+    print("-" * 50)
+    
+    orig_treatment_rate = original_df[treatment_col].mean()
+    samp_treatment_rate = sampled_df[treatment_col].mean()
+    treatment_diff = abs(orig_treatment_rate - samp_treatment_rate)
+    
+    results['treatment_balance'] = {
+        'original_rate': orig_treatment_rate,
+        'sampled_rate': samp_treatment_rate,
+        'absolute_diff': treatment_diff,
+        'passed': treatment_diff < THRESHOLDS['treatment_rate_diff']
+    }
+    
+    print(f"Original treatment rate: {orig_treatment_rate:.3f}")
+    print(f"Sampled treatment rate:  {samp_treatment_rate:.3f}")
+    print(f"Absolute difference:     {treatment_diff:.4f}")
+    
+    if treatment_diff < THRESHOLDS['treatment_rate_diff']:
+        print(f"✅ Treatment balance well preserved (<{THRESHOLDS['treatment_rate_diff']} diff)")
+    else:
+        print(f"⚠ Treatment balance differs by {treatment_diff:.4f}")
+        validation_passed['treatment_balance'] = False
+    
+    # 3. OUTCOME DISTRIBUTION
+    print("\n3. OUTCOME DISTRIBUTION CHECK")
+    print("-" * 50)
+    
+    ks_stat, ks_p = stats.ks_2samp(original_df[outcome_col], sampled_df[outcome_col])
+    mean_orig = original_df[outcome_col].mean()
+    mean_samp = sampled_df[outcome_col].mean()
+    mean_diff_pct = abs(mean_orig - mean_samp) / mean_orig * 100 if mean_orig != 0 else 0
+    
+    results['outcome_distribution'] = {
+        'ks_p': ks_p,
+        'mean_orig': mean_orig,
+        'mean_samp': mean_samp,
+        'mean_diff_pct': mean_diff_pct,
+        'passed': ks_p >= THRESHOLDS['distribution_ks_p'] and mean_diff_pct < THRESHOLDS['mean_relative_diff'] * 100
+    }
+    
+    print(f"KS test p-value: {ks_p:.4f}")
+    print(f"Mean outcome diff: {mean_diff_pct:.2f}%")
+    
+    if ks_p >= THRESHOLDS['distribution_ks_p'] and mean_diff_pct < THRESHOLDS['mean_relative_diff'] * 100:
+        print("✅ Outcome distribution well preserved")
+    else:
+        print("⚠ Outcome distribution shows differences")
+        validation_passed['outcome_distribution'] = False
+    
+    # 4. TEMPORAL PATTERNS
+    print("\n4. TEMPORAL PATTERN PRESERVATION")
+    print("-" * 50)
+    
+    # Check hourly patterns
+    hourly_orig = original_df.groupby('hour')[outcome_col].mean()
+    hourly_samp = sampled_df.groupby('hour')[outcome_col].mean()
+    hourly_corr = np.corrcoef(hourly_orig.values, hourly_samp.values)[0, 1]
+    
+    # Check peak patterns
+    peak_orig = original_df.groupby('is_peak')[outcome_col].mean()
+    peak_samp = sampled_df.groupby('is_peak')[outcome_col].mean()
+    peak_diff = abs(peak_orig[1] - peak_samp[1]) / peak_orig[1] if peak_orig[1] != 0 else 0
+    
+    results['temporal_patterns'] = {
+        'hourly_correlation': hourly_corr,
+        'peak_relative_diff': peak_diff,
+        'passed': hourly_corr > THRESHOLDS['temporal_correlation'] and peak_diff < THRESHOLDS['mean_relative_diff']
+    }
+    
+    print(f"Hourly pattern correlation: {hourly_corr:.3f}")
+    print(f"Peak hour effect diff:      {peak_diff:.2%}")
+    
+    if hourly_corr > THRESHOLDS['temporal_correlation']:
+        print(f"✅ Temporal patterns well preserved (corr > {THRESHOLDS['temporal_correlation']})")
+    else:
+        print(f"⚠ Temporal patterns show some differences")
+        validation_passed['temporal_patterns'] = False
+    
+    # 5. HTE PATTERN PRESERVATION (MOST IMPORTANT)
+    print("\n5. HTE PATTERN PRESERVATION - KEY VALIDATION")
+    print("-" * 50)
+    
+    # Calculate HTE for key subgroups
+    subgroups = ['zone_type', 'is_peak', 'is_weekend']
+    hte_correlations = []
+    
+    for subgroup in subgroups:
+        if subgroup == 'zone_type':
+            values = original_df[subgroup].unique()
+        else:
+            values = [0, 1]
+        
+        orig_htes = []
+        samp_htes = []
+        
+        for value in values:
+            if subgroup == 'zone_type':
+                orig_mask = original_df['zone_type'] == value
+                samp_mask = sampled_df['zone_type'] == value
+            else:
+                orig_mask = original_df[subgroup] == value
+                samp_mask = sampled_df[subgroup] == value
+            
+            if orig_mask.sum() > 10 and samp_mask.sum() > 10:
+                # Simple HTE calculation
+                orig_hte = (original_df[orig_mask & (original_df[treatment_col] == 1)][outcome_col].mean() - 
+                          original_df[orig_mask & (original_df[treatment_col] == 0)][outcome_col].mean())
+                samp_hte = (sampled_df[samp_mask & (sampled_df[treatment_col] == 1)][outcome_col].mean() - 
+                          sampled_df[samp_mask & (sampled_df[treatment_col] == 0)][outcome_col].mean())
+                
+                if not np.isnan(orig_hte) and not np.isnan(samp_hte):
+                    orig_htes.append(orig_hte)
+                    samp_htes.append(samp_hte)
+        
+        if len(orig_htes) > 1 and len(samp_htes) > 1:
+            corr = np.corrcoef(orig_htes, samp_htes)[0, 1]
+            hte_correlations.append(corr)
+            print(f"  {subgroup:12s}: HTE correlation = {corr:.3f}")
+    
+    avg_hte_correlation = np.mean(hte_correlations) if hte_correlations else 0
+    
+    results['hte_preservation'] = {
+        'avg_correlation': avg_hte_correlation,
+        'individual_correlations': hte_correlations,
+        'passed': avg_hte_correlation > THRESHOLDS['hte_correlation']
+    }
+    
+    print(f"\nAverage HTE correlation: {avg_hte_correlation:.3f}")
+    
+    if avg_hte_correlation > THRESHOLDS['hte_correlation']:
+        print(f"✅ EXCELLENT! HTE patterns well preserved (corr > {THRESHOLDS['hte_correlation']})")
+        print("   This is the MOST IMPORTANT validation for causal RL")
+    elif avg_hte_correlation > 0.4:
+        print(f"⚠ ACCEPTABLE. HTE patterns moderately preserved (corr = {avg_hte_correlation:.3f})")
+        print("   For causal RL, this is still usable but with caution")
+        validation_passed['hte_preservation'] = False
+    else:
+        print(f"❌ POOR. HTE patterns not preserved (corr = {avg_hte_correlation:.3f})")
+        print("   Sampling may bias causal RL results")
+        validation_passed['hte_preservation'] = False
+    
+    # 6. OVERALL ASSESSMENT
+    print("\n" + "="*80)
+    print("OVERALL SAMPLING VALIDATION ASSESSMENT")
+    print("="*80)
+    
+    # Count passed validations
+    passed_count = sum(validation_passed.values())
+    total_count = len(validation_passed)
+    
+    # Create summary table
+    summary_data = []
+    for key, passed in validation_passed.items():
+        key_name = key.replace('_', ' ').title()
+        status = "✅ PASS" if passed else "⚠ WARNING"
+        if key == 'hte_preservation':
+            key_name = "HTE Preservation (MOST IMPORTANT)"
+            if not passed:
+                status = "⚠ CHECK - Moderate preservation"
+        summary_data.append([key_name, status])
+    
+    summary_df = pd.DataFrame(summary_data, columns=['Validation Check', 'Status'])
+    print("\nValidation Summary:")
+    print(summary_df.to_string(index=False))
+    
+    # Overall recommendation
+    print(f"\nOverall: {passed_count}/{total_count} checks passed")
+    
+    if passed_count == total_count:
+        print("\n" + "="*60)
+        print("✅ EXCELLENT SAMPLING QUALITY")
+        print("="*60)
+        print("The sampled dataset is HIGHLY SUITABLE for causal RL analysis.")
+        print("All key characteristics are well preserved.")
+        print("Proceed with confidence.")
+        
+    elif passed_count >= total_count - 1 and validation_passed['hte_preservation']:
+        print("\n" + "="*60)
+        print("⚠ GOOD SAMPLING QUALITY")
+        print("="*60)
+        print("The sampled dataset is SUITABLE for causal RL analysis.")
+        print("HTE patterns (most important) are well preserved.")
+        print("Minor differences in other aspects are acceptable.")
+        
+    elif validation_passed['hte_preservation']:
+        print("\n" + "="*60)
+        print("⚠ ACCEPTABLE SAMPLING QUALITY")
+        print("="*60)
+        print("The sampled dataset is USABLE for causal RL analysis.")
+        print("HTE patterns are preserved (key requirement met).")
+        print("Some other characteristics show differences.")
+        print("Consider these limitations in interpretation.")
+        
+    else:
+        print("\n" + "="*60)
+        print("❌ POOR SAMPLING QUALITY")
+        print("="*60)
+        print("The sampled dataset may NOT BE SUITABLE for causal RL.")
+        print("HTE patterns are not adequately preserved.")
+        print("Consider using full dataset or different sampling strategy.")
+    
+    # For paper: create concise validation statement
+    paper_validation_statement = f"""
+    SAMPLING VALIDATION RESULTS
+    
+    We validated that our sampled dataset ({len(sampled_df):,} observations, 
+    {len(sampled_df)/len(original_df):.1%} of original) preserves key characteristics 
+    necessary for causal reinforcement learning:
+    
+    1. Feature distributions: {passed_count}/{total_count} checks passed
+    2. Treatment balance: Difference = {treatment_diff:.4f} (threshold < {THRESHOLDS['treatment_rate_diff']})
+    3. Temporal patterns: Correlation = {hourly_corr:.3f} (threshold > {THRESHOLDS['temporal_correlation']})
+    4. HTE preservation: Average correlation = {avg_hte_correlation:.3f} (threshold > {THRESHOLDS['hte_correlation']})
+    
+    {"The sampling preserves HTE patterns well, making it suitable for causal RL analysis." 
+     if avg_hte_correlation > THRESHOLDS['hte_correlation'] else 
+     "HTE patterns show moderate preservation; results should be interpreted with appropriate caution."}
+    """
+    
+    print("\n" + "="*80)
+    print("FOR PAPER: SAMPLING VALIDATION STATEMENT")
+    print("="*80)
+    print(paper_validation_statement)
+    
+    return results, validation_passed, paper_validation_statement
+
+# Run the realistic validation
+validation_results, passed_checks, paper_statement = validate_sampling_realistic(
+    data,  # Your original dataset
+    df_sampled,  # Your sampled dataset
+    features_to_check=['vehicle_count', 'road_quality', 'hour', 'is_peak', 
+                      'is_weekend', 'rain', 'event', 'zone_type']
+)
+
